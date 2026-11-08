@@ -259,7 +259,7 @@ def _refused(ip):
         s.close()
 
 
-LIMITS = {"memory_mb": 2048, "cpu_percent": 200, "disk_mb": 10240, "pids": 1024}
+LIMITS = {"memory_mb": 2048, "cpu_percent": 200, "disk_mb": 4096, "pids": 1024}
 
 
 def test_validation(version):
@@ -270,6 +270,10 @@ def test_validation(version):
     check("daemon port is refused", api("POST", "/v1/servers", {**base, "port": API_PORT})[0] == 400)
     check("URL injection in version is refused", api("POST", "/v1/servers", {**base, "version": "../../evil"})[0] == 400)
     check("bad limits are refused", api("POST", "/v1/servers", {**base, "limits": {**LIMITS, "memory_mb": 1}})[0] == 400)
+    too_big = {"memory_mb": 4000000, "cpu_percent": 25600, "disk_mb": 1000000000}
+    for field, value in too_big.items():
+        code, body = api("POST", "/v1/servers", {**base, "limits": {**LIMITS, field: value}})
+        check(f"{field} beyond this machine is refused", code == 400, str(body))
     evil = {**base, "flavor": "bedrock", "bedrock_url": "https://evil.example/bedrock-server-1.zip"}
     check("non-Mojang Bedrock link is refused", api("POST", "/v1/servers", evil)[0] == 400)
 
@@ -285,6 +289,8 @@ def test_full_server(version, data_root):
     if state != "offline":
         print(api("GET", f"/v1/servers/{sid}"))
         return
+    code, _ = api("PATCH", f"/v1/servers/{sid}", {"limits": {**LIMITS, "memory_mb": 4000000}})
+    check("settings cannot exceed this machine either", code == 400, str(code))
     dup = api("POST", "/v1/servers", {**req, "name": "dup"})
     check("port conflict is refused", dup[0] == 409, str(dup[0]))
 
@@ -485,19 +491,14 @@ def test_flavor(flavor, port):
     check(f"{flavor} lists versions", bool(stable), str(code))
     if not stable:
         return
-    req = {"name": f"E2E {flavor}", "flavor": flavor, "version": stable[0], "limits": LIMITS, "port": port, "eula_accepted": True}
+    req = {"name": f"E2E {flavor}", "flavor": flavor, "version": stable[0], "limits": LIMITS, "port": port, "eula_accepted": True, "start_after_install": True}
     code, info = api("POST", "/v1/servers", req)
     check(f"{flavor} {stable[0]} is created", code == 201, str(code))
     if code != 201:
         return
     sid = info["id"]
-    state, detail = wait_state(sid, ("offline",), 600)
-    check(f"{flavor} installs", state == "offline", f"{state} {detail and detail.get('last_error')}")
-    if state != "offline":
-        return
-    api("POST", f"/v1/servers/{sid}/power", {"action": "start"})
-    state, _ = wait_state(sid, ("running",), 420)
-    check(f"{flavor} reaches running", state == "running", str(state))
+    state, detail = wait_state(sid, ("running",), 900)
+    check(f"{flavor} installs and starts itself", state == "running", f"{state} {detail and detail.get('last_error')}")
     if state == "running":
         ok, detail = ext_ping(port)
         check(f"{flavor} answers a player", ok, detail)

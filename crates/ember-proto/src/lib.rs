@@ -95,6 +95,9 @@ pub struct CreateServer {
     pub port: u16,
     /// The operator must explicitly accept the Minecraft EULA.
     pub eula_accepted: bool,
+    /// Starts the server once its install finishes, even if the panel has closed.
+    #[serde(default)]
+    pub start_after_install: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

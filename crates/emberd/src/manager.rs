@@ -375,6 +375,8 @@ impl Manager {
     pub async fn create(self: &Arc<Self>, req: CreateServer) -> ApiResult<ServerInfo> {
         validate_name(&req.name).map_err(bad_request)?;
         req.limits.validate().map_err(bad_request)?;
+        let cap = crate::node::capacity(&self.cfg.data_dir);
+        crate::node::check_limits(&req.limits, &cap, cap.disk_free_mb).map_err(bad_request)?;
         if !req.eula_accepted {
             return Err(bad_request("you must accept the Minecraft EULA to create a server"));
         }
@@ -423,11 +425,11 @@ impl Manager {
 
         let inst = Instance::new(rec, path, ServerState::Installing);
         self.servers.write().expect("servers lock").insert(id, inst.clone());
-        self.spawn_install(inst.clone());
+        self.spawn_install(inst.clone(), req.start_after_install);
         Ok(inst.info())
     }
 
-    fn spawn_install(self: &Arc<Self>, inst: Arc<Instance>) {
+    fn spawn_install(self: &Arc<Self>, inst: Arc<Instance>, start_after: bool) {
         let mgr = self.clone();
         tokio::spawn(async move {
             let _power = inst.power.lock().await;
@@ -437,6 +439,9 @@ impl Manager {
                 Ok(()) => {
                     inst.log("[ember] Install complete. The server is ready to start.");
                     inst.set_state(ServerState::Offline);
+                    if start_after {
+                        let _ = mgr.restart_tx.send(inst.clone());
+                    }
                 }
                 Err(e) => {
                     let msg = format!("{e:#}");
@@ -452,7 +457,7 @@ impl Manager {
     pub async fn reinstall(self: &Arc<Self>, inst: Arc<Instance>) -> ApiResult<()> {
         match inst.state() {
             ServerState::Offline | ServerState::Crashed | ServerState::InstallFailed => {
-                self.spawn_install(inst);
+                self.spawn_install(inst, false);
                 Ok(())
             }
             _ => Err(conflict("stop the server before reinstalling it")),
@@ -682,6 +687,8 @@ impl Manager {
         }
         if let Some(l) = &req.limits {
             l.validate().map_err(bad_request)?;
+            let cap = crate::node::capacity(&self.cfg.data_dir);
+            crate::node::check_limits(l, &cap, cap.disk_total_mb).map_err(bad_request)?;
         }
         inst.update(|r| {
             if let Some(n) = req.name {

@@ -43,6 +43,43 @@ fn statvfs(path: &Path) -> (u64, u64) {
     (total.saturating_sub(s.f_bavail * frag), total)
 }
 
+/// What this machine physically has to give.
+#[derive(Debug, Clone, Copy)]
+pub struct Capacity {
+    pub threads: u32,
+    pub memory_mb: u64,
+    pub disk_total_mb: u64,
+    pub disk_free_mb: u64,
+}
+
+const MIB: u64 = 1024 * 1024;
+
+pub fn capacity(data_dir: &Path) -> Capacity {
+    let (_, memory_total) = std::fs::read_to_string("/proc/meminfo").map_or((0, 0), |t| parse_meminfo(&t));
+    let (disk_used, disk_total) = statvfs(data_dir);
+    Capacity {
+        threads: cpu_count(),
+        memory_mb: memory_total / MIB,
+        disk_total_mb: disk_total / MIB,
+        disk_free_mb: disk_total.saturating_sub(disk_used) / MIB,
+    }
+}
+
+/// `disk_max_mb` is free space for a new server, and total space for an existing one,
+/// whose current files already count as used.
+pub fn check_limits(l: &ember_proto::Limits, cap: &Capacity, disk_max_mb: u64) -> Result<(), String> {
+    if l.memory_mb > cap.memory_mb {
+        return Err(format!("this node only has {} MB of memory", cap.memory_mb));
+    }
+    if l.cpu_percent > cap.threads * 100 {
+        return Err(format!("this node only has {} CPU threads", cap.threads));
+    }
+    if l.disk_mb > disk_max_mb {
+        return Err(format!("this node only has {disk_max_mb} MB of disk available"));
+    }
+    Ok(())
+}
+
 pub fn stats(data_dir: &Path, cpu_percent: f32, total: u32, running: u32) -> NodeStats {
     let (memory_used, memory_total) = std::fs::read_to_string("/proc/meminfo").map_or((0, 0), |t| parse_meminfo(&t));
     let (disk_used, disk_total) = statvfs(data_dir);
@@ -125,6 +162,17 @@ pub fn isolation_checks() -> Vec<IsolationCheck> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn limits_cannot_exceed_the_machine() {
+        let cap = Capacity { threads: 8, memory_mb: 16_000, disk_total_mb: 100_000, disk_free_mb: 40_000 };
+        let ok = ember_proto::Limits { memory_mb: 16_000, cpu_percent: 800, disk_mb: 40_000, pids: 512 };
+        assert!(check_limits(&ok, &cap, cap.disk_free_mb).is_ok(), "exactly the machine's size is allowed");
+        assert!(check_limits(&ember_proto::Limits { memory_mb: 16_001, ..ok }, &cap, cap.disk_free_mb).is_err());
+        assert!(check_limits(&ember_proto::Limits { cpu_percent: 900, ..ok }, &cap, cap.disk_free_mb).is_err());
+        assert!(check_limits(&ember_proto::Limits { disk_mb: 40_001, ..ok }, &cap, cap.disk_free_mb).is_err());
+        assert!(check_limits(&ember_proto::Limits { disk_mb: 90_000, ..ok }, &cap, cap.disk_total_mb).is_ok());
+    }
 
     #[test]
     fn parses_proc_files() {
