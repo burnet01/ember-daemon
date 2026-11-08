@@ -131,6 +131,10 @@ pub struct EnvVar {
 /// What a server starts with. `None` and empty values use the automatic defaults.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StartupOptions {
+    /// A full command line, like `java -Xmx4G -jar server.jar nogui`. When set it
+    /// replaces the heap, jar, flag and argument fields below.
+    #[serde(default)]
+    pub custom_command: Option<String>,
     /// Java version override. `None` uses the version Minecraft asks for.
     #[serde(default)]
     pub java_major: Option<u32>,
@@ -155,6 +159,9 @@ pub struct StartupInfo {
     pub options: StartupOptions,
     /// The exact command the server will run, or why it cannot be built yet.
     pub command: String,
+    /// The automatic command in editable form, as a starting point for a custom one.
+    #[serde(default)]
+    pub auto_command: String,
     pub is_java: bool,
     pub version: String,
     /// The version Minecraft asks for, used when `options.java_major` is `None`.

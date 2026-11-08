@@ -26,6 +26,7 @@ const MAX_LINE_BYTES: usize = 8 * 1024;
 const UID_BASE: u32 = 200_000;
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const DISK_SCAN_EVERY: Duration = Duration::from_secs(30);
+const CPU_SAMPLE_WINDOW: Duration = Duration::from_secs(1);
 const SCHEDULE_TICK: Duration = Duration::from_secs(5);
 const MAX_CRASH_RESTARTS: usize = 5;
 const CRASH_WINDOW: Duration = Duration::from_secs(600);
@@ -73,7 +74,7 @@ pub struct Instance {
     power: tokio::sync::Mutex<()>,
     started: Mutex<Option<Instant>>,
     disk_bytes: AtomicU64,
-    cpu_sample: Mutex<Option<(Instant, u64)>>,
+    cpu_sample: Mutex<Option<(Instant, u64, f32)>>,
     expected_exit: AtomicBool,
     crashes: Mutex<Vec<Instant>>,
 }
@@ -217,21 +218,23 @@ impl Instance {
         let active = matches!(self.state(), ServerState::Starting | ServerState::Running | ServerState::Stopping);
         let usage = if active { cgroup::read_usage(&key) } else { cgroup::Usage::default() };
         let now = Instant::now();
+        // Several readers share this sample, so it only advances about once a second.
+        // Otherwise each reader measures a different, possibly tiny, slice of time.
         let cpu_percent = {
             let mut sample = self.cpu_sample.lock().expect("cpu lock");
-            let pct = match *sample {
-                Some((t, prev)) if active && usage.cpu_usec >= prev => {
+            match *sample {
+                Some((t, _, pct)) if active && now.duration_since(t) < CPU_SAMPLE_WINDOW => pct,
+                Some((t, prev, _)) if active && usage.cpu_usec >= prev => {
                     let dt = now.duration_since(t).as_secs_f64();
-                    if dt > 0.05 {
-                        ((usage.cpu_usec - prev) as f64 / 1e6 / dt * 100.0) as f32
-                    } else {
-                        0.0
-                    }
+                    let pct = ((usage.cpu_usec - prev) as f64 / 1e6 / dt * 100.0) as f32;
+                    *sample = Some((now, usage.cpu_usec, pct));
+                    pct
                 }
-                _ => 0.0,
-            };
-            *sample = active.then_some((now, usage.cpu_usec));
-            pct
+                _ => {
+                    *sample = active.then_some((now, usage.cpu_usec, 0.0));
+                    0.0
+                }
+            }
         };
         ServerStats {
             cpu_percent,
@@ -706,6 +709,13 @@ impl Manager {
         StartupInfo {
             options: rec.startup.clone(),
             command,
+            auto_command: rec.start.as_ref().map_or_else(String::new, |start| {
+                let mut argv = auto_argv(&rec, start);
+                if argv[0] == "/opt/java/bin/java" {
+                    argv[0] = "java".into();
+                }
+                display_command(&[], &argv)
+            }),
             is_java: rec.flavor != Flavor::Bedrock,
             version: rec.version.clone(),
             default_java: rec.java_major,
@@ -957,6 +967,12 @@ fn heap_mb(memory_mb: u64) -> u64 {
 const JAVA_VERSIONS: [u32; 5] = [8, 11, 17, 21, 25];
 
 fn validate_startup(o: &StartupOptions, memory_mb: u64) -> Result<(), String> {
+    if let Some(cmd) = &o.custom_command {
+        if cmd.len() > 8192 || cmd.contains(['\n', '\r', '\0']) {
+            return Err("the command must be a single line".into());
+        }
+        parse_command(cmd)?;
+    }
     if let Some(j) = o.java_major {
         if !JAVA_VERSIONS.contains(&j) {
             return Err(format!("Java {j} is not available"));
@@ -1002,11 +1018,95 @@ fn build_command(rec: &ServerRecord) -> Result<(Vec<String>, EnvVars)> {
     let o = &rec.startup;
     let mut env = base_env();
     let start = rec.start.as_ref().ok_or_else(|| anyhow!("Available after the server finishes installing."))?;
-    let mut argv = match start {
-        StartSpec::Native { binary } => {
-            env.push(("LD_LIBRARY_PATH".into(), ".".into()));
-            vec![format!("{HOME}/{binary}")]
+    if matches!(start, StartSpec::Native { .. }) {
+        env.push(("LD_LIBRARY_PATH".into(), ".".into()));
+    }
+    let argv = match &o.custom_command {
+        Some(cmd) => resolve_program(parse_command(&expand_variables(cmd, rec)).map_err(|e| anyhow!(e))?),
+        None => auto_argv(rec, start),
+    };
+    for var in &o.env {
+        env.retain(|(k, _)| *k != var.name);
+        env.push((var.name.clone(), var.value.clone()));
+    }
+    Ok((argv, env))
+}
+
+/// `{{MEMORY}}` is the automatic heap in MB, and `{{PORT}}` is the server's game port.
+fn expand_variables(cmd: &str, rec: &ServerRecord) -> String {
+    cmd.replace("{{MEMORY}}", &heap_mb(rec.limits.memory_mb).to_string()).replace("{{PORT}}", &rec.port.to_string())
+}
+
+/// Splits a command line the way a shell would, without running one: plain words,
+/// single quotes, double quotes and backslash escapes. For real shell features,
+/// the command can be `sh -c '...'`, which still runs inside the sandbox.
+fn parse_command(cmd: &str) -> Result<Vec<String>, String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut chars = cmd.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                in_word = true;
+                loop {
+                    match chars.next() {
+                        Some('\'') => break,
+                        Some(q) => word.push(q),
+                        None => return Err("the command has an unclosed single quote".into()),
+                    }
+                }
+            }
+            '"' => {
+                in_word = true;
+                loop {
+                    match chars.next() {
+                        Some('"') => break,
+                        Some('\\') => word.push(chars.next().ok_or("the command ends with a backslash")?),
+                        Some(q) => word.push(q),
+                        None => return Err("the command has an unclosed double quote".into()),
+                    }
+                }
+            }
+            '\\' => {
+                in_word = true;
+                word.push(chars.next().ok_or("the command ends with a backslash")?);
+            }
+            c if c.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+            }
+            c => {
+                in_word = true;
+                word.push(c);
+            }
         }
+    }
+    if in_word {
+        words.push(word);
+    }
+    if words.is_empty() {
+        return Err("the command is empty".into());
+    }
+    Ok(words)
+}
+
+/// `java` means the server's selected runtime, and other bare names are found on the PATH.
+fn resolve_program(mut argv: Vec<String>) -> Vec<String> {
+    if argv[0] == "java" {
+        argv[0] = "/opt/java/bin/java".into();
+    } else if !argv[0].contains('/') {
+        argv.insert(0, "/usr/bin/env".into());
+    }
+    argv
+}
+
+fn auto_argv(rec: &ServerRecord, start: &StartSpec) -> Vec<String> {
+    let o = &rec.startup;
+    let mut argv = match start {
+        StartSpec::Native { binary } => vec![format!("{HOME}/{binary}")],
         StartSpec::Jar { .. } | StartSpec::ArgsFile { .. } => {
             let max = o.max_heap_mb.unwrap_or_else(|| heap_mb(rec.limits.memory_mb)).min(rec.limits.memory_mb);
             let min = o.min_heap_mb.unwrap_or(512).min(max);
@@ -1022,11 +1122,7 @@ fn build_command(rec: &ServerRecord) -> Result<(Vec<String>, EnvVars)> {
         }
     };
     argv.extend(o.server_args.iter().cloned());
-    for var in &o.env {
-        env.retain(|(k, _)| *k != var.name);
-        env.push((var.name.clone(), var.value.clone()));
-    }
-    Ok((argv, env))
+    argv
 }
 
 fn display_command(env: &[EnvVar], argv: &[String]) -> String {
@@ -1227,6 +1323,38 @@ mod tests {
         assert_eq!(argv, ["/opt/java/bin/java", "-Xms1024M", "-Xmx2048M", "-XX:+UseG1GC", "-jar", "custom.jar", "--port", "1"]);
         assert_eq!(env.iter().filter(|(k, _)| k == "HOME").count(), 1, "an override replaces the default");
         assert!(env.iter().any(|(k, v)| k == "HOME" && v == "/x"));
+    }
+
+    #[test]
+    fn parses_command_lines_like_a_shell() {
+        let w = |s: &str| parse_command(s).unwrap();
+        assert_eq!(w("java -Xmx4G -jar server.jar nogui"), ["java", "-Xmx4G", "-jar", "server.jar", "nogui"]);
+        assert_eq!(w(r#"java "-Dmotd=hello world" 'a b' c\ d"#), ["java", "-Dmotd=hello world", "a b", "c d"]);
+        assert_eq!(w("  a   b  "), ["a", "b"]);
+        assert_eq!(w("a ''"), ["a", ""]);
+        for bad in ["", "   ", "java 'open", "java \"open", "java \\"] {
+            assert!(parse_command(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn custom_command_replaces_the_automatic_one() {
+        let mut r = java_record();
+        r.startup.jvm_args = vec!["-Dignored=yes".into()];
+        r.startup.custom_command = Some("java -Xmx{{MEMORY}}M -Dport={{PORT}} -jar paper.jar".into());
+        let (argv, _) = build_command(&r).unwrap();
+        assert_eq!(argv, ["/opt/java/bin/java", "-Xmx3584M", "-Dport=25565", "-jar", "paper.jar"]);
+
+        r.startup.custom_command = Some("sh -c 'exec java -jar a.jar'".into());
+        assert_eq!(build_command(&r).unwrap().0, ["/usr/bin/env", "sh", "-c", "exec java -jar a.jar"]);
+
+        r.startup.custom_command = Some("./start.sh now".into());
+        assert_eq!(build_command(&r).unwrap().0, ["./start.sh", "now"]);
+
+        for bad in ["java 'open", "a\nb", "   "] {
+            let o = StartupOptions { custom_command: Some(bad.into()), ..Default::default() };
+            assert!(validate_startup(&o, 4096).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

@@ -456,6 +456,27 @@ def test_startup(sid, base):
         check("the JVM really got the custom flags", b"-Dember.e2e=yes" in cmd and b"-XX:+UseG1GC" in cmd)
         check("the JVM really got the environment", b"EMBER_E2E=works" in environ)
 
+    print("=== full custom startup command", flush=True)
+    bad_cmd = api("PUT", f"{base}/startup", {"options": {**chosen, "custom_command": "java 'unclosed"}})
+    check("an unparseable command is refused", bad_cmd[0] == 400, str(bad_cmd[0]))
+    api("POST", f"{base}/power", {"action": "kill"})
+    wait_state(sid, ("offline",), 30)
+    custom = {**chosen, "custom_command": "java -Xms256M -Xmx{{MEMORY}}M \"-Dember.custom=a b\" -Dember.port={{PORT}} -jar server.jar nogui"}
+    code, saved = api("PUT", f"{base}/startup", {"options": custom})
+    check("a custom command saves", code == 200, str(code))
+    check("the preview shows the custom command", "-Xmx1792M" in saved["command"] and "-Xms600M" not in saved["command"], saved["command"])
+    api("POST", f"{base}/power", {"action": "start"})
+    state, _ = wait_state(sid, ("running",), 240)
+    check("server boots from a custom command", state == "running", str(state))
+    pids = pathlib.Path(f"/sys/fs/cgroup/ember/{sid}/cgroup.procs").read_text().split()
+    java = [p for p in pids if os.path.exists(f"/proc/{p}/exe") and os.readlink(f"/proc/{p}/exe").endswith("/bin/java")]
+    if java:
+        cmd = pathlib.Path(f"/proc/{java[0]}/cmdline").read_bytes().split(b"\0")
+        check("the custom command really ran", b"-Dember.custom=a b" in cmd and b"-Dember.port=25565" in cmd and b"-Xmx1792M" in cmd, str(cmd[:6]))
+        check("the replaced fields were not used", b"-Dember.e2e=yes" not in cmd)
+    else:
+        check("a Java process runs from the custom command", False)
+
 
 def test_flavor(flavor, port):
     print(f"=== boot {flavor}", flush=True)
