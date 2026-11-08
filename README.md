@@ -44,6 +44,7 @@ GitHub Actions never runs automatically, to keep usage low. Start one suite at a
 | `e2e-all-flavors` | The same, plus Paper, Fabric and Forge boots |
 | `panel` | Builds and tests the Windows app |
 | `release` | Builds the release daemon |
+| `tailnet-test` | Runs a temporary node on your tailnet for 20 minutes to try the panel, then leaves. Needs the `TS_AUTHKEY` (ephemeral) and `EMBER_OWNER` secrets. Not for hosting |
 
 CI runners are not on a tailnet, so the end-to-end test replaces tailscaled with a fake one speaking the same local API. Everything else in that path is real.
 
