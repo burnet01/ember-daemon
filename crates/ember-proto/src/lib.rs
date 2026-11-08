@@ -103,7 +103,6 @@ pub struct UpdateServer {
     pub limits: Option<Limits>,
     pub autostart: Option<bool>,
     pub restart_on_crash: Option<bool>,
-    pub extra_jvm_args: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,10 +117,58 @@ pub struct ServerInfo {
     pub state: ServerState,
     pub autostart: bool,
     pub restart_on_crash: bool,
-    pub extra_jvm_args: Vec<String>,
     pub java_major: Option<u32>,
     pub created_at: u64,
     pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvVar {
+    pub name: String,
+    pub value: String,
+}
+
+/// What a server starts with. `None` and empty values use the automatic defaults.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartupOptions {
+    /// Java version override. `None` uses the version Minecraft asks for.
+    #[serde(default)]
+    pub java_major: Option<u32>,
+    #[serde(default)]
+    pub min_heap_mb: Option<u64>,
+    #[serde(default)]
+    pub max_heap_mb: Option<u64>,
+    /// Jar to run, relative to the server folder. `None` uses the installed one.
+    #[serde(default)]
+    pub jar: Option<String>,
+    #[serde(default)]
+    pub jvm_args: Vec<String>,
+    /// Arguments after the jar, such as `nogui`.
+    #[serde(default)]
+    pub server_args: Vec<String>,
+    #[serde(default)]
+    pub env: Vec<EnvVar>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StartupInfo {
+    pub options: StartupOptions,
+    /// The exact command the server will run, or why it cannot be built yet.
+    pub command: String,
+    pub is_java: bool,
+    pub version: String,
+    /// The version Minecraft asks for, used when `options.java_major` is `None`.
+    pub default_java: Option<u32>,
+    pub java_versions: Vec<u32>,
+    pub default_max_heap_mb: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateStartup {
+    pub options: StartupOptions,
+    /// A different Minecraft version here reinstalls the server software.
+    #[serde(default)]
+    pub version: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

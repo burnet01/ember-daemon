@@ -83,6 +83,7 @@ pub fn router(app: AppState) -> Router {
         .route("/command", post(command))
         .route("/reinstall", post(reinstall))
         .route("/stats", get(server_stats))
+        .route("/startup", get(get_startup).put(put_startup))
         .route("/console", get(console))
         .route("/files", get(list_files).delete(remove_file))
         .route("/files/content", get(read_file).put(write_file))
@@ -222,6 +223,17 @@ async fn reinstall(State(app): State<AppState>, Path(id): Path<Uuid>) -> ApiResu
 
 async fn server_stats(State(app): State<AppState>, Path(id): Path<Uuid>) -> ApiResult<Json<ServerStats>> {
     Ok(Json(inst(&app, id)?.stats()))
+}
+
+async fn get_startup(State(app): State<AppState>, Path(id): Path<Uuid>) -> ApiResult<Json<StartupInfo>> {
+    let s = inst(&app, id)?;
+    Ok(Json(app.mgr.startup_info(&s)))
+}
+
+async fn put_startup(State(app): State<AppState>, Path(id): Path<Uuid>, Json(req): Json<UpdateStartup>) -> ApiResult<Json<StartupInfo>> {
+    let s = inst(&app, id)?;
+    app.mgr.update_startup(s.clone(), req).await?;
+    Ok(Json(app.mgr.startup_info(&s)))
 }
 
 // ---- Console ----

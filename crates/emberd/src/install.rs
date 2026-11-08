@@ -344,6 +344,9 @@ pub async fn run(mgr: &Arc<Manager>, inst: &Arc<Instance>) -> Result<()> {
     let major = runtime_major(mojang.java_major);
     inst.log(&format!("[ember] Minecraft {version} needs Java {}. Using Java {major}.", mojang.java_major));
     ensure_java(mgr, major).await?;
+    if let Some(chosen) = inst.record().startup.java_major {
+        ensure_java(mgr, chosen).await?;
+    }
     inst.update(|r| r.java_major = Some(major));
 
     let start = match flavor {

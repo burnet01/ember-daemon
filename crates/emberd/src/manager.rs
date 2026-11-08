@@ -52,7 +52,8 @@ pub struct ServerRecord {
     pub index: u32,
     pub autostart: bool,
     pub restart_on_crash: bool,
-    pub extra_jvm_args: Vec<String>,
+    #[serde(default)]
+    pub startup: StartupOptions,
     pub java_major: Option<u32>,
     pub created_at: u64,
     pub start: Option<StartSpec>,
@@ -204,7 +205,6 @@ impl Instance {
             state: self.state(),
             autostart: r.autostart,
             restart_on_crash: r.restart_on_crash,
-            extra_jvm_args: r.extra_jvm_args,
             java_major: r.java_major,
             created_at: r.created_at,
             last_error: r.last_error,
@@ -397,7 +397,10 @@ impl Manager {
             index,
             autostart: false,
             restart_on_crash: false,
-            extra_jvm_args: Vec::new(),
+            startup: StartupOptions {
+                server_args: if req.flavor == Flavor::Bedrock { vec![] } else { vec!["nogui".to_string()] },
+                ..Default::default()
+            },
             java_major: None,
             created_at: now_secs(),
             start: None,
@@ -457,7 +460,7 @@ impl Manager {
         let rec = inst.record();
         let owner = inst.owner();
         let mut ro_binds = Vec::new();
-        if let Some(major) = rec.java_major {
+        if let Some(major) = rec.startup.java_major.or(rec.java_major) {
             ro_binds.push(RoBind { src: self.runtimes_dir().join(format!("java-{major}")), dst: "/opt/java".into() });
         }
         build_spec(&self.cfg, owner, self.data_dir(inst.id), cgroup::dir_for(&inst.id.to_string()), netns, ro_binds, argv, env, rec.limits.disk_mb)
@@ -517,30 +520,6 @@ impl Manager {
         }
     }
 
-    fn start_command(&self, rec: &ServerRecord) -> Result<(Vec<String>, EnvVars)> {
-        let mut env = base_env();
-        let start = rec.start.as_ref().ok_or_else(|| anyhow!("this server has not been installed"))?;
-        let argv = match start {
-            StartSpec::Native { binary } => {
-                env.push(("LD_LIBRARY_PATH".into(), ".".into()));
-                vec![format!("{HOME}/{binary}")]
-            }
-            StartSpec::Jar { .. } | StartSpec::ArgsFile { .. } => {
-                let heap = heap_mb(rec.limits.memory_mb);
-                let mut a = vec!["/opt/java/bin/java".to_string(), format!("-Xms{}M", heap.min(512)), format!("-Xmx{heap}M")];
-                a.extend(rec.extra_jvm_args.iter().cloned());
-                match start {
-                    StartSpec::Jar { path } => a.extend(["-jar".to_string(), path.clone()]),
-                    StartSpec::ArgsFile { path } => a.push(format!("@{path}")),
-                    StartSpec::Native { .. } => unreachable!("matched above"),
-                }
-                a.push("nogui".into());
-                a
-            }
-        };
-        Ok((argv, env))
-    }
-
     pub async fn start(self: &Arc<Self>, inst: Arc<Instance>) -> ApiResult<()> {
         let _power = inst.power.lock().await;
         self.start_locked(&inst).await
@@ -558,7 +537,10 @@ impl Manager {
         if scanned > rec.limits.disk_mb * 1024 * 1024 {
             return Err(conflict("the server is over its disk limit; free space or raise the limit"));
         }
-        let (argv, env) = self.start_command(&rec)?;
+        let (argv, env) = build_command(&rec)?;
+        if let Some(major) = rec.startup.java_major.or(rec.java_major).filter(|_| rec.flavor != Flavor::Bedrock) {
+            install::ensure_java(self, major).await.context("prepare Java")?;
+        }
 
         let data = self.data_dir(inst.id);
         let owner = inst.owner();
@@ -698,11 +680,6 @@ impl Manager {
         if let Some(l) = &req.limits {
             l.validate().map_err(bad_request)?;
         }
-        if let Some(args) = &req.extra_jvm_args {
-            if args.len() > 64 || args.iter().any(|a| !a.starts_with('-') || a.contains('\0') || a.len() > 1024) {
-                return Err(bad_request("JVM arguments must be flags starting with '-'"));
-            }
-        }
         inst.update(|r| {
             if let Some(n) = req.name {
                 r.name = n.trim().to_string();
@@ -716,10 +693,53 @@ impl Manager {
             if let Some(c) = req.restart_on_crash {
                 r.restart_on_crash = c;
             }
-            if let Some(args) = req.extra_jvm_args {
-                r.extra_jvm_args = args;
+        });
+        Ok(())
+    }
+
+    pub fn startup_info(&self, inst: &Instance) -> StartupInfo {
+        let rec = inst.record();
+        let command = match build_command(&rec) {
+            Ok((argv, _)) => display_command(&rec.startup.env, &argv),
+            Err(e) => e.to_string(),
+        };
+        StartupInfo {
+            options: rec.startup.clone(),
+            command,
+            is_java: rec.flavor != Flavor::Bedrock,
+            version: rec.version.clone(),
+            default_java: rec.java_major,
+            java_versions: JAVA_VERSIONS.to_vec(),
+            default_max_heap_mb: heap_mb(rec.limits.memory_mb),
+        }
+    }
+
+    pub async fn update_startup(self: &Arc<Self>, inst: Arc<Instance>, req: UpdateStartup) -> ApiResult<()> {
+        let rec = inst.record();
+        validate_startup(&req.options, rec.limits.memory_mb).map_err(bad_request)?;
+        let new_version = match req.version.filter(|v| *v != rec.version) {
+            Some(_) if rec.flavor == Flavor::Bedrock => {
+                return Err(bad_request("change a Bedrock version by reinstalling with a new download link"));
+            }
+            Some(v) => {
+                install::validate_version(&v).map_err(|e| bad_request(e.to_string()))?;
+                if !matches!(inst.state(), ServerState::Offline | ServerState::Crashed | ServerState::InstallFailed) {
+                    return Err(conflict("stop the server before changing its version"));
+                }
+                Some(v)
+            }
+            None => None,
+        };
+        let reinstall = new_version.is_some();
+        inst.update(|r| {
+            r.startup = req.options;
+            if let Some(v) = new_version {
+                r.version = v;
             }
         });
+        if reinstall {
+            self.reinstall(inst).await?;
+        }
         Ok(())
     }
 
@@ -934,6 +954,96 @@ fn heap_mb(memory_mb: u64) -> u64 {
     memory_mb.saturating_sub(overhead).max(128)
 }
 
+const JAVA_VERSIONS: [u32; 5] = [8, 11, 17, 21, 25];
+
+fn validate_startup(o: &StartupOptions, memory_mb: u64) -> Result<(), String> {
+    if let Some(j) = o.java_major {
+        if !JAVA_VERSIONS.contains(&j) {
+            return Err(format!("Java {j} is not available"));
+        }
+    }
+    if let Some(max) = o.max_heap_mb {
+        if !(128..=memory_mb).contains(&max) {
+            return Err(format!("maximum heap must be between 128 MB and the {memory_mb} MB memory limit"));
+        }
+    }
+    if let Some(min) = o.min_heap_mb {
+        if min < 64 || min > o.max_heap_mb.unwrap_or_else(|| heap_mb(memory_mb)) {
+            return Err("minimum heap must be at least 64 MB and no more than the maximum heap".into());
+        }
+    }
+    if let Some(jar) = &o.jar {
+        files::clean_nonroot(jar).map_err(|_| "the jar must be a path inside the server folder".to_string())?;
+    }
+    let bad_arg = |a: &String| a.is_empty() || a.len() > 1024 || a.contains('\0');
+    if o.jvm_args.len() > 128 || o.jvm_args.iter().any(|a| bad_arg(a) || !a.starts_with('-')) {
+        return Err("JVM flags must each start with '-'".into());
+    }
+    if o.server_args.len() > 64 || o.server_args.iter().any(bad_arg) {
+        return Err("invalid server argument".into());
+    }
+    if o.env.len() > 64 {
+        return Err("too many environment variables".into());
+    }
+    for e in &o.env {
+        let mut chars = e.name.chars();
+        let valid = chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && e.name.len() <= 128;
+        if !valid || e.value.contains('\0') || e.value.len() > 4096 {
+            return Err(format!("invalid environment variable {:?}", e.name));
+        }
+    }
+    Ok(())
+}
+
+/// The single source of truth for what runs: both start and the Startup tab's preview use it.
+fn build_command(rec: &ServerRecord) -> Result<(Vec<String>, EnvVars)> {
+    let o = &rec.startup;
+    let mut env = base_env();
+    let start = rec.start.as_ref().ok_or_else(|| anyhow!("Available after the server finishes installing."))?;
+    let mut argv = match start {
+        StartSpec::Native { binary } => {
+            env.push(("LD_LIBRARY_PATH".into(), ".".into()));
+            vec![format!("{HOME}/{binary}")]
+        }
+        StartSpec::Jar { .. } | StartSpec::ArgsFile { .. } => {
+            let max = o.max_heap_mb.unwrap_or_else(|| heap_mb(rec.limits.memory_mb)).min(rec.limits.memory_mb);
+            let min = o.min_heap_mb.unwrap_or(512).min(max);
+            let mut a = vec!["/opt/java/bin/java".to_string(), format!("-Xms{min}M"), format!("-Xmx{max}M")];
+            a.extend(o.jvm_args.iter().cloned());
+            match (&o.jar, start) {
+                (Some(jar), _) => a.extend(["-jar".to_string(), jar.clone()]),
+                (None, StartSpec::Jar { path }) => a.extend(["-jar".to_string(), path.clone()]),
+                (None, StartSpec::ArgsFile { path }) => a.push(format!("@{path}")),
+                (None, StartSpec::Native { .. }) => unreachable!("matched above"),
+            }
+            a
+        }
+    };
+    argv.extend(o.server_args.iter().cloned());
+    for var in &o.env {
+        env.retain(|(k, _)| *k != var.name);
+        env.push((var.name.clone(), var.value.clone()));
+    }
+    Ok((argv, env))
+}
+
+fn display_command(env: &[EnvVar], argv: &[String]) -> String {
+    let quote = |s: &str| {
+        if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "-_=./:@+,".contains(c)) {
+            s.to_string()
+        } else {
+            format!("'{}'", s.replace('\'', "'\\''"))
+        }
+    };
+    env.iter()
+        .map(|e| format!("{}={}", e.name, quote(&e.value)))
+        .chain(argv.iter().map(|a| quote(a)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn base_env() -> Vec<(String, String)> {
     [
         ("HOME", HOME),
@@ -1080,6 +1190,69 @@ mod tests {
         assert_eq!(sanitize_line(b"tab\tok"), "tab\tok");
     }
 
+    fn java_record() -> ServerRecord {
+        ServerRecord {
+            id: Uuid::nil(),
+            name: "t".into(),
+            flavor: Flavor::Paper,
+            version: "26.3".into(),
+            bedrock_url: None,
+            limits: Limits { memory_mb: 4096, cpu_percent: 100, disk_mb: 1024, pids: 128 },
+            port: 25565,
+            index: 1,
+            autostart: false,
+            restart_on_crash: false,
+            startup: StartupOptions { server_args: vec!["nogui".into()], ..Default::default() },
+            java_major: Some(25),
+            created_at: 0,
+            start: Some(StartSpec::Jar { path: "server.jar".into() }),
+            last_error: None,
+            schedules: vec![],
+        }
+    }
+
+    #[test]
+    fn command_uses_defaults_then_overrides() {
+        let mut r = java_record();
+        let (argv, _) = build_command(&r).unwrap();
+        assert_eq!(argv, ["/opt/java/bin/java", "-Xms512M", "-Xmx3584M", "-jar", "server.jar", "nogui"]);
+
+        r.startup.min_heap_mb = Some(1024);
+        r.startup.max_heap_mb = Some(2048);
+        r.startup.jar = Some("custom.jar".into());
+        r.startup.jvm_args = vec!["-XX:+UseG1GC".into()];
+        r.startup.server_args = vec!["--port".into(), "1".into()];
+        r.startup.env = vec![EnvVar { name: "HOME".into(), value: "/x".into() }];
+        let (argv, env) = build_command(&r).unwrap();
+        assert_eq!(argv, ["/opt/java/bin/java", "-Xms1024M", "-Xmx2048M", "-XX:+UseG1GC", "-jar", "custom.jar", "--port", "1"]);
+        assert_eq!(env.iter().filter(|(k, _)| k == "HOME").count(), 1, "an override replaces the default");
+        assert!(env.iter().any(|(k, v)| k == "HOME" && v == "/x"));
+    }
+
+    #[test]
+    fn startup_validation_rejects_bad_values() {
+        let ok = StartupOptions { java_major: Some(21), max_heap_mb: Some(2048), min_heap_mb: Some(512), ..Default::default() };
+        assert!(validate_startup(&ok, 4096).is_ok());
+        let bad = [
+            StartupOptions { java_major: Some(99), ..Default::default() },
+            StartupOptions { max_heap_mb: Some(8192), ..Default::default() },
+            StartupOptions { max_heap_mb: Some(1024), min_heap_mb: Some(2048), ..Default::default() },
+            StartupOptions { jar: Some("../../etc/passwd".into()), ..Default::default() },
+            StartupOptions { jvm_args: vec!["nope".into()], ..Default::default() },
+            StartupOptions { env: vec![EnvVar { name: "BAD NAME".into(), value: "x".into() }], ..Default::default() },
+        ];
+        for o in bad {
+            assert!(validate_startup(&o, 4096).is_err(), "{o:?}");
+        }
+    }
+
+    #[test]
+    fn displayed_command_is_quoted() {
+        let argv = vec!["java".to_string(), "-Dmotd=hello world".to_string()];
+        let env = [EnvVar { name: "A".into(), value: "b c".into() }];
+        assert_eq!(display_command(&env, &argv), "A='b c' java '-Dmotd=hello world'");
+    }
+
     #[test]
     fn heap_leaves_native_headroom() {
         assert_eq!(heap_mb(2048), 1792);
@@ -1119,7 +1292,7 @@ mod tests {
             index: 1,
             autostart: false,
             restart_on_crash: false,
-            extra_jvm_args: vec![],
+            startup: StartupOptions::default(),
             java_major: None,
             created_at: 0,
             start: None,

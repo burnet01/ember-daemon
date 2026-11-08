@@ -413,6 +413,8 @@ def test_backups_and_power(sid, data):
     ok, detail = ext_ping(25565)
     check("the configured port is enforced after a bad edit", ok, detail)
 
+    test_startup(sid, base)
+
     check("kill is accepted", api("POST", f"{base}/power", {"action": "kill"})[0] == 202)
     state, _ = wait_state(sid, ("offline",), 30)
     check("kill reaches offline", state == "offline", str(state))
@@ -421,6 +423,38 @@ def test_backups_and_power(sid, data):
     check("server deletes", code == 204, str(code))
     check("server files are gone", not data.exists())
     check("host is intact after delete", pathlib.Path("/etc/passwd").exists())
+
+
+def test_startup(sid, base):
+    print("=== startup options", flush=True)
+    code, info = api("GET", f"{base}/startup")
+    check("startup shows the real command", code == 200 and "-jar server.jar nogui" in info["command"], str(info))
+    check("startup reports the default Java", info["default_java"] == 25 or info["default_java"] is not None)
+    opts = info["options"]
+    bad = [{**opts, "max_heap_mb": 999999}, {**opts, "java_major": 99}, {**opts, "jar": "../../etc/passwd"}, {**opts, "jvm_args": ["nope"]}, {**opts, "env": [{"name": "BAD NAME", "value": "x"}]}]
+    check("invalid startup options are refused", all(api("PUT", f"{base}/startup", {"options": b})[0] == 400 for b in bad))
+    busy = api("PUT", f"{base}/startup", {"options": opts, "version": "1.21.1"})
+    check("version cannot change while running", busy[0] == 409, str(busy[0]))
+
+    api("POST", f"{base}/power", {"action": "kill"})
+    wait_state(sid, ("offline",), 30)
+    chosen = {**opts, "min_heap_mb": 600, "max_heap_mb": 1200, "jvm_args": ["-XX:+UseG1GC", "-Dember.e2e=yes"], "env": [{"name": "EMBER_E2E", "value": "works"}]}
+    code, saved = api("PUT", f"{base}/startup", {"options": chosen})
+    check("startup options save", code == 200, str(code))
+    check("the preview shows the new command", "-Xmx1200M" in saved["command"] and "-Dember.e2e=yes" in saved["command"], saved["command"])
+
+    api("POST", f"{base}/power", {"action": "start"})
+    state, _ = wait_state(sid, ("running",), 240)
+    check("server boots with custom options", state == "running", str(state))
+    pids = pathlib.Path(f"/sys/fs/cgroup/ember/{sid}/cgroup.procs").read_text().split()
+    java = [p for p in pids if os.path.exists(f"/proc/{p}/exe") and os.readlink(f"/proc/{p}/exe").endswith("/bin/java")]
+    check("a Java process is running", bool(java))
+    if java:
+        cmd = pathlib.Path(f"/proc/{java[0]}/cmdline").read_bytes().split(b"\0")
+        environ = pathlib.Path(f"/proc/{java[0]}/environ").read_bytes().split(b"\0")
+        check("the JVM really got the heap flags", b"-Xms600M" in cmd and b"-Xmx1200M" in cmd)
+        check("the JVM really got the custom flags", b"-Dember.e2e=yes" in cmd and b"-XX:+UseG1GC" in cmd)
+        check("the JVM really got the environment", b"EMBER_E2E=works" in environ)
 
 
 def test_flavor(flavor, port):
