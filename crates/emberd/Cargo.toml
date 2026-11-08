@@ -1,0 +1,42 @@
+[package]
+name = "emberd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+default = ["tls"]
+# Off only for type-checking from a non-Linux dev machine, where ring cannot build.
+tls = ["reqwest/rustls-tls-webpki-roots"]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ember-proto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+futures-util.workspace = true
+uuid.workspace = true
+axum = { version = "0.8", features = ["ws", "macros"] }
+tokio-util = { version = "0.7", features = ["io"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "http2"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+toml = "0.8"
+libc = "0.2"
+landlock = "0.4"
+cap-std = "4"
+cap-fs-ext = "4"
+walkdir = "2"
+tar = "0.4"
+flate2 = "1"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+sha1 = "0.10"
+sha2 = "0.10"
+hex = "0.4"
+cron = "0.15"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+anyhow = "1"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+tempfile = "3"

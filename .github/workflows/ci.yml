@@ -1,0 +1,133 @@
+name: CI
+
+# Manual only, one suite per run, to keep Actions usage low.
+# Example: gh workflow run CI -f suite=sandbox
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: Which single test suite to run
+        required: true
+        default: unit
+        type: choice
+        options:
+          - unit
+          - sandbox
+          - e2e-vanilla
+          - e2e-all-flavors
+          - panel
+          - release
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  unit:
+    name: Unit tests and lints
+    if: inputs.suite == 'unit'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: linux-${{ hashFiles('Cargo.lock') }}
+          restore-keys: linux-
+      - run: rustup toolchain install stable --profile minimal -c clippy && rustup default stable
+      - run: cargo clippy -p emberd -p ember-proto -p ember-probe --all-targets -- -D warnings
+      - run: cargo test -p ember-proto -p emberd
+
+  sandbox:
+    name: Sandbox escape attempts
+    if: inputs.suite == 'sandbox'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: linux-${{ hashFiles('Cargo.lock') }}
+          restore-keys: linux-
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - run: cargo build -p emberd -p ember-probe
+      - run: sudo ./target/debug/emberd doctor
+      - run: sudo bash scripts/ci-sandbox.sh
+
+  e2e:
+    name: Real Minecraft end to end
+    if: inputs.suite == 'e2e-vanilla' || inputs.suite == 'e2e-all-flavors'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: linux-${{ hashFiles('Cargo.lock') }}
+          restore-keys: linux-
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - run: cargo build -p emberd
+      - name: Run end-to-end test
+        env:
+          FLAVORS: ${{ inputs.suite == 'e2e-all-flavors' && 'paper,fabric,forge' || '' }}
+        run: sudo python3 scripts/e2e.py --emberd ./target/debug/emberd --flavors "$FLAVORS"
+
+  panel:
+    name: Desktop app (Windows)
+    if: inputs.suite == 'panel'
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: windows-${{ hashFiles('Cargo.lock') }}
+          restore-keys: windows-
+      - run: rustup toolchain install stable --profile minimal; rustup default stable
+      - run: cargo test -p ember-panel
+      - run: cargo build --release -p ember-panel
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ember-panel-windows
+          path: target/release/ember-panel.exe
+          retention-days: 7
+
+  release:
+    name: Daemon release build
+    if: inputs.suite == 'release'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - run: cargo build --release -p emberd
+      - uses: actions/upload-artifact@v4
+        with:
+          name: emberd-linux-x86_64
+          path: |
+            target/release/emberd
+            packaging/*
+          retention-days: 7

@@ -1,0 +1,19 @@
+[Unit]
+Description=Ember node daemon
+Documentation=https://github.com/
+Wants=network-online.target tailscaled.service
+After=network-online.target tailscaled.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/emberd run
+Restart=on-failure
+RestartSec=5
+# Must exceed the time servers need to stop and save their worlds.
+TimeoutStopSec=120
+KillMode=mixed
+# Servers live in /sys/fs/cgroup/ember, outside this unit, and emberd stops them itself.
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
