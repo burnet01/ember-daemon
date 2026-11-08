@@ -11,6 +11,14 @@ Ember assumes a game server can be fully compromised, because Minecraft plugins 
 - Requests with an `Origin` header, without the client header, or with an unexpected `Host` are refused. That stops a web page open on your computer from reaching the API through CSRF or DNS rebinding.
 - The app refuses to connect to anything outside Tailscale's address ranges and ignores system proxies.
 
+## SFTP
+
+- The built-in SFTP server listens only on the Tailscale address, on port 2022.
+- Identity is checked when each connection opens, with the same rules as the API, before any SSH traffic. Any password is accepted after that, because the Tailscale identity is the login.
+- Each server has its own username, and a username only ever opens that server's folder. An owner can use every server's username, because owners already manage every server.
+- It offers SFTP only: no shell, command execution or port forwarding. Links cannot be created, and existing links are never followed out of the folder.
+- FTP is not offered, because it has no encryption of its own.
+
 ## Sandbox layers
 
 | Layer | Provides |
