@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 use uuid::Uuid;
 
 const BACKLOG_LINES: usize = 2000;
@@ -268,6 +268,8 @@ pub struct Manager {
     servers: RwLock<HashMap<Uuid, Arc<Instance>>>,
     index_lock: Mutex<()>,
     cpu_prev: Mutex<Option<(u64, u64)>>,
+    restart_tx: mpsc::UnboundedSender<Arc<Instance>>,
+    restart_rx: Mutex<Option<mpsc::UnboundedReceiver<Arc<Instance>>>>,
 }
 
 impl Manager {
@@ -277,7 +279,10 @@ impl Manager {
             .https_only(true)
             .connect_timeout(Duration::from_secs(20))
             .build()?;
+        let (restart_tx, restart_rx) = mpsc::unbounded_channel();
         let mgr = Arc::new(Self {
+            restart_tx,
+            restart_rx: Mutex::new(Some(restart_rx)),
             cfg,
             http,
             java_lock: tokio::sync::Mutex::new(()),
@@ -624,9 +629,9 @@ impl Manager {
             tokio::time::sleep(Duration::from_secs(5)).await;
             if inst.state() == ServerState::Crashed {
                 inst.log("[ember] Restarting after crash");
-                if let Err(e) = self.start(inst.clone()).await {
-                    inst.log(&format!("[ember] Restart failed: {}", e.1));
-                }
+                // Queued rather than awaited: starting a server spawns this monitor, so
+                // calling start here would make the two futures depend on each other.
+                let _ = self.restart_tx.send(inst.clone());
             }
         }
     }
@@ -811,6 +816,17 @@ impl Manager {
     // ---- Background work ----
 
     pub fn spawn_background(self: &Arc<Self>) {
+        if let Some(mut rx) = self.restart_rx.lock().expect("restart lock").take() {
+            let mgr = self.clone();
+            tokio::spawn(async move {
+                while let Some(inst) = rx.recv().await {
+                    if let Err(e) = mgr.start(inst.clone()).await {
+                        inst.log(&format!("[ember] Restart failed: {}", e.1));
+                    }
+                }
+            });
+        }
+
         let mgr = self.clone();
         tokio::spawn(async move {
             loop {

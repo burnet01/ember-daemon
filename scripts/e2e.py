@@ -308,8 +308,19 @@ def test_full_server(version, data_root):
     expected_uid = data.stat().st_uid
     check("server has a dedicated unprivileged uid", expected_uid >= 200000, str(expected_uid))
     procs = pathlib.Path(f"/sys/fs/cgroup/ember/{sid}/cgroup.procs").read_text().split()
-    uids = {os.stat(f"/proc/{p}").st_uid for p in procs if os.path.exists(f"/proc/{p}")}
-    check("game processes run as that uid", expected_uid in uids, str(uids))
+    owners = {p: os.stat(f"/proc/{p}").st_uid for p in procs if os.path.exists(f"/proc/{p}")}
+    check("game processes run as that uid", set(owners.values()) - {0} == {expected_uid}, str(owners))
+    # The helper that waits outside the namespaces joins the cgroup as root. It must be the
+    # only root process, and it must not share the sandbox's PID namespace.
+    roots = [p for p, uid in owners.items() if uid == 0]
+    inside = [p for p, uid in owners.items() if uid == expected_uid]
+    check("only the outer helper is root", len(roots) == 1, str(roots))
+    if roots and inside:
+        cmdline = pathlib.Path(f"/proc/{roots[0]}/cmdline").read_bytes()
+        check("the root process is the sandbox helper", b"__sandbox-init" in cmdline, cmdline[:60].decode(errors="replace"))
+        helper_ns = os.readlink(f"/proc/{roots[0]}/ns/pid")
+        game_ns = os.readlink(f"/proc/{inside[0]}/ns/pid")
+        check("the root helper is outside the sandbox PID namespace", helper_ns != game_ns, f"{helper_ns} vs {game_ns}")
     limit = pathlib.Path(f"/sys/fs/cgroup/ember/{sid}/memory.max").read_text().strip()
     check("memory cgroup is enforced", limit == str(2048 << 20), limit)
 

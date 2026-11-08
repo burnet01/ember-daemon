@@ -69,11 +69,18 @@ fn cli() -> anyhow::Result<()> {
 
 #[cfg(target_os = "linux")]
 fn doctor() -> anyhow::Result<()> {
+    // Landlock is an extra layer that older kernels lack, and emberd turns forwarding on itself.
+    let optional = |name: &str| matches!(name, "landlock" | "forwarding");
     let checks = node::isolation_checks();
     for c in &checks {
-        println!("{} {:<11} {}", if c.ok { "[ ok ]" } else { "[FAIL]" }, c.name, c.detail);
+        let tag = match (c.ok, optional(&c.name)) {
+            (true, _) => "[ ok ]",
+            (false, true) => "[warn]",
+            (false, false) => "[FAIL]",
+        };
+        println!("{tag} {:<11} {}", c.name, c.detail);
     }
-    if checks.iter().any(|c| !c.ok && c.name != "forwarding") {
+    if checks.iter().any(|c| !c.ok && !optional(&c.name)) {
         anyhow::bail!("this machine is missing requirements");
     }
     Ok(())

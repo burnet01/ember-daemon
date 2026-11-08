@@ -6,7 +6,7 @@
 //! resolves every component beneath the root and refuses to leave it.
 
 use anyhow::{anyhow, bail, Context, Result};
-use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
+use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, File, OpenOptions, OpenOptionsExt as _, PermissionsExt as _};
 use ember_proto::FileEntry;
@@ -120,8 +120,11 @@ pub fn mkdirs(root: &Dir, rel: &Path, owner: Owner) -> Result<()> {
         cur.push(name);
         match root.create_dir(&cur) {
             Ok(()) => {
-                let d = root.open_dir_nofollow(&cur).context("open directory")?;
-                fchown(&d, Some(owner.uid), Some(owner.gid))?;
+                // A real read handle: fchown fails on the O_PATH handle open_dir_nofollow returns.
+                let mut opts = OpenOptions::new();
+                opts.read(true).custom_flags(libc::O_DIRECTORY).follow(FollowSymlinks::No);
+                let d = root.open_with(&cur, &opts).context("open directory")?;
+                fchown(&d, Some(owner.uid), Some(owner.gid)).context("set directory owner")?;
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(e).context("create directory"),
