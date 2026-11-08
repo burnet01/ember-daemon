@@ -5,6 +5,7 @@ use uuid::Uuid;
 
 pub const API_VERSION: u32 = 1;
 pub const DEFAULT_PORT: u16 = 8787;
+pub const SFTP_PORT: u16 = 2022;
 /// Every request must carry this header. Browsers cannot attach it to a
 /// cross-site request without a CORS preflight, which the daemon never grants.
 pub const CLIENT_HEADER: &str = "x-ember-client";
@@ -280,6 +281,14 @@ pub struct BackupInfo {
     pub created_at: u64,
 }
 
+/// A backup being created right now. `total_bytes` is 0 until the size has been measured.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupProgress {
+    pub name: String,
+    pub done_bytes: u64,
+    pub total_bytes: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateBackup {
     pub name: String,
@@ -336,6 +345,11 @@ pub struct CommandRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiError {
     pub error: String,
+}
+
+/// The SFTP username for a server: the start of its ID.
+pub fn sftp_user(id: Uuid) -> String {
+    id.simple().to_string()[..8].to_string()
 }
 
 /// Rejects names that would be confusing in the UI or unsafe in logs.

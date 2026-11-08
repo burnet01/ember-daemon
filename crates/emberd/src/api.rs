@@ -92,6 +92,7 @@ pub fn router(app: AppState) -> Router {
         .route("/files/download", get(download_file))
         .route("/files/upload", put(upload_file).layer(DefaultBodyLimit::disable()))
         .route("/backups", get(list_backups).post(create_backup))
+        .route("/backups/progress", get(backup_progress))
         .route("/backups/{backup}", delete(delete_backup))
         .route("/backups/{backup}/restore", post(restore_backup))
         .route("/schedules", get(list_schedules).post(create_schedule))
@@ -418,6 +419,10 @@ async fn list_backups(State(app): State<AppState>, Path(id): Path<Uuid>) -> ApiR
     inst(&app, id)?;
     let mgr = app.mgr.clone();
     Ok(Json(blocking(move || mgr.list_backups(id)).await?))
+}
+
+async fn backup_progress(State(app): State<AppState>, Path(id): Path<Uuid>) -> ApiResult<Json<Option<BackupProgress>>> {
+    Ok(Json(inst(&app, id)?.backup_progress()))
 }
 
 async fn create_backup(State(app): State<AppState>, Path(id): Path<Uuid>, Json(req): Json<CreateBackup>) -> ApiResult<(StatusCode, Json<BackupInfo>)> {

@@ -29,6 +29,8 @@ mod node;
 mod sandbox;
 #[cfg(target_os = "linux")]
 mod sandbox_test;
+#[cfg(target_os = "linux")]
+mod sftp;
 
 #[cfg(target_os = "linux")]
 fn main() {
@@ -120,6 +122,16 @@ async fn serve(config: std::path::PathBuf) -> anyhow::Result<()> {
 
     let mgr = manager::Manager::load(cfg)?;
     mgr.spawn_background();
+
+    {
+        let (mgr, ts, me) = (mgr.clone(), ts.clone(), me.clone());
+        tokio::spawn(async move {
+            // File transfer is an extra: the panel should still work if this cannot start.
+            if let Err(e) = sftp::serve(mgr, ts, me, ip).await {
+                tracing::error!("SFTP stopped: {e:#}");
+            }
+        });
+    }
 
     let app = api::router(api::AppState { mgr: mgr.clone(), ts, me });
     let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| format!("listen on {addr}"))?;

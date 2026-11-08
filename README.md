@@ -28,6 +28,10 @@ Download `ember-panel-windows` from a `panel` CI run, or run `cargo run --releas
 
 `ember-panel --demo` shows the interface with sample data and makes no network connections.
 
+## File transfer
+
+Each server's Files tab shows its SFTP address, like `sftp://1a2b3c4d@100.x.y.z:2022`. Use it with FileZilla or WinSCP from a device logged in to your Tailscale account. No password is needed.
+
 ## Security model
 
 See [docs/SECURITY.md](docs/SECURITY.md) for what is protected, how, and the known limits.

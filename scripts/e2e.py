@@ -31,6 +31,8 @@ OWNER_IP = "127.0.0.5"
 STRANGER_IP = "127.0.0.6"
 TAGGED_IP = "127.0.0.7"
 API_PORT = 8787
+SFTP_PORT = 2022
+VERSION = {}
 EXT_NS = "ember-e2e-ext"
 HOST_VETH_IP = "10.214.0.1"
 OWNER = "owner@example.com"
@@ -268,6 +270,7 @@ def test_validation(version):
     check("EULA must be accepted", api("POST", "/v1/servers", {**base, "eula_accepted": False})[0] == 400)
     check("low port is refused", api("POST", "/v1/servers", {**base, "port": 22})[0] == 400)
     check("daemon port is refused", api("POST", "/v1/servers", {**base, "port": API_PORT})[0] == 400)
+    check("SFTP port is refused", api("POST", "/v1/servers", {**base, "port": SFTP_PORT})[0] == 400)
     check("URL injection in version is refused", api("POST", "/v1/servers", {**base, "version": "../../evil"})[0] == 400)
     check("bad limits are refused", api("POST", "/v1/servers", {**base, "limits": {**LIMITS, "memory_mb": 1}})[0] == 400)
     too_big = {"memory_mb": 4000000, "cpu_percent": 25600, "disk_mb": 1000000000}
@@ -383,6 +386,79 @@ def test_files(sid, data, uid):
     os.unlink(data / "upload-evil")
     check("rename works", api("POST", f"{base}/rename", {"from": "mods/blob.bin", "to": "mods/b2.bin"})[0] == 204)
     check("delete works", api("DELETE", f"{base}?path=mods")[0] == 204)
+    test_sftp(sid, data, uid)
+
+
+def sftp(user, batch, source=OWNER_IP):
+    """Runs a real OpenSSH sftp client. Each failing command makes the whole batch fail."""
+    cmd = ["sftp", "-b", "-", "-P", str(SFTP_PORT), "-o", f"BindAddress={source}", "-o", "StrictHostKeyChecking=no",
+           "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=10", f"{user}@{NODE_IP}"]
+    r = subprocess.run(cmd, input=batch, capture_output=True, text=True, timeout=60)
+    return r.returncode == 0, (r.stdout + r.stderr)[-400:]
+
+
+def test_sftp(sid, data, uid):
+    print("=== SFTP", flush=True)
+    user = sid.replace("-", "")[:8]
+    local = pathlib.Path(tempfile.mkdtemp(prefix="ember-sftp-"))
+    (local / "up.txt").write_text("from sftp")
+    shadow = pathlib.Path("/etc/shadow")
+    before = shadow.read_bytes()
+
+    check("stranger on the tailnet is refused", not sftp(user, "ls\n", source=STRANGER_IP)[0])
+    check("tagged device is refused", not sftp(user, "ls\n", source=TAGGED_IP)[0])
+    check("the node itself is refused", not sftp(user, "ls\n", source=NODE_IP)[0])
+    check("an unknown username is refused", not sftp("00000000", "ls\n")[0])
+
+    ok, out = sftp(user, "ls\n")
+    check("owner can list the server's files", ok and "server.jar" in out, out)
+    ok, out = sftp(user, f"mkdir sftpdir\nput {local}/up.txt sftpdir/up.txt\nget sftpdir/up.txt {local}/down.txt\n")
+    check("upload and download work", ok and (local / "down.txt").read_text() == "from sftp", out)
+    check("uploads belong to the server", (data / "sftpdir/up.txt").stat().st_uid == uid)
+    check("new folders belong to the server", (data / "sftpdir").stat().st_uid == uid)
+    ok, out = sftp(user, "rename sftpdir/up.txt sftpdir/moved.txt\nrm sftpdir/moved.txt\nrmdir sftpdir\n")
+    check("rename and delete work", ok and not (data / "sftpdir").exists(), out)
+
+    check("/etc/passwd is not reachable", not sftp(user, f"get /etc/passwd {local}/x\n")[0])
+    check("traversal stays inside", not sftp(user, f"get ../../../../etc/passwd {local}/x\n")[0])
+    ok, out = sftp(user, "cd ../../..\npwd\n")
+    check("cd cannot leave the top", ok and "/\n" in out, out)
+    os.symlink("/etc/shadow", data / "sftp-evil")
+    os.symlink("/etc", data / "sftp-evildir")
+    check("read through a file symlink is refused", not sftp(user, f"get sftp-evil {local}/x\n")[0])
+    check("read through a dir symlink is refused", not sftp(user, f"get sftp-evildir/passwd {local}/x\n")[0])
+    check("write through a file symlink is refused", not sftp(user, f"put {local}/up.txt sftp-evil\n")[0])
+    check("write through a dir symlink is refused", not sftp(user, f"put {local}/up.txt sftp-evildir/sftp-pwned\n")[0])
+    check("/etc/shadow is untouched", shadow.read_bytes() == before)
+    check("nothing was created in /etc", not pathlib.Path("/etc/sftp-pwned").exists())
+    os.unlink(data / "sftp-evil")
+    os.unlink(data / "sftp-evildir")
+    check("links cannot be created", not sftp(user, "symlink /etc/shadow made-link\n")[0])
+    check("no link was made", not os.path.lexists(data / "made-link"))
+
+    # One server's login must only ever reach that server.
+    (data / "only-in-a.txt").write_text("secret to server A")
+    other = {"name": "E2E other", "flavor": "vanilla", "version": VERSION["id"], "limits": LIMITS, "port": 25577, "eula_accepted": True}
+    code, info = api("POST", "/v1/servers", other)
+    check("a second server is created", code == 201, str(code))
+    if code == 201:
+        state, _ = wait_state(info["id"], ("offline",), 300)
+        check("the second server installs", state == "offline", str(state))
+        other_user = info["id"].replace("-", "")[:8]
+        check("each server has its own username", other_user != user)
+        ok, out = sftp(other_user, "ls\n")
+        check("its login sees its own files", ok and "server.jar" in out and "only-in-a.txt" not in out, out)
+        check("its login cannot fetch another server's file", not sftp(other_user, f"get only-in-a.txt {local}/stolen\n")[0])
+        check("traversal cannot reach another server", not sftp(other_user, f"get ../{sid}/data/only-in-a.txt {local}/stolen\n")[0])
+        check("nothing was taken", not (local / "stolen").exists())
+        api("DELETE", f"/v1/servers/{info['id']}")
+    os.unlink(data / "only-in-a.txt")
+
+    shell = subprocess.run(["ssh", "-p", str(SFTP_PORT), "-o", f"BindAddress={OWNER_IP}", "-o", "StrictHostKeyChecking=no",
+                            "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=10",
+                            "-T", f"{user}@{NODE_IP}", "id"], capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
+    check("there is no shell", "uid=" not in shell.stdout, shell.stdout[-200:])
+    shutil.rmtree(local, ignore_errors=True)
 
 
 def test_backups_and_power(sid, data):
@@ -395,8 +471,34 @@ def test_backups_and_power(sid, data):
     check("schedule is deleted", api("DELETE", f"{base}/schedules/{sched['id']}")[0] == 204)
 
     (data / "marker.txt").write_text("original")
+    seen, done = [], threading.Event()
+
+    def watch():
+        while not done.is_set():
+            _, p = api("GET", f"{base}/backups/progress")
+            if p:
+                seen.append(p)
+            time.sleep(0.2)
+
+    watcher = threading.Thread(target=watch)
+    watcher.start()
+    second = {}
+
+    def try_second():
+        time.sleep(1)
+        second["code"] = api("POST", f"{base}/backups", {"name": "overlap"}, timeout=300)[0]
+
+    overlap = threading.Thread(target=try_second)
+    overlap.start()
     code, backup = api("POST", f"{base}/backups", {"name": "before"}, timeout=300)
+    done.set()
+    watcher.join()
+    overlap.join()
     check("backup is created", code == 201, str(code))
+    check("progress is visible while it runs", bool(seen) and seen[0]["name"] == "before", str(seen[:1]))
+    check("progress never passes 100%", all(p["done_bytes"] <= p["total_bytes"] for p in seen))
+    check("a second backup at once is refused", second.get("code") == 409, str(second))
+    check("progress clears when it finishes", api("GET", f"{base}/backups/progress")[1] is None)
     check("restore refuses a running server", api("POST", f"{base}/backups/{backup['id']}/restore")[0] == 409)
 
     check("stop is accepted", api("POST", f"{base}/power", {"action": "stop"})[0] == 202)
@@ -548,6 +650,7 @@ def main():
         test_auth()
         _, versions = api("GET", "/v1/versions/vanilla")
         version = next(v["id"] for v in versions if v["stable"])
+        VERSION["id"] = version
         test_validation(version)
         test_full_server(version, data_root)
         for i, flavor in enumerate(f for f in a.flavors.split(",") if f):

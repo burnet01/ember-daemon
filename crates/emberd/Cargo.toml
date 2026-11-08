@@ -37,6 +37,9 @@ hex = "0.4"
 cron = "0.15"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 anyhow = "1"
+russh = { version = "0.65.1", default-features = false, features = ["ring"] }
+russh-sftp = "3.0.1"
+rand = "0.10"
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 tempfile = "3"

@@ -77,6 +77,7 @@ pub struct Instance {
     cpu_sample: Mutex<Option<(Instant, u64, f32)>>,
     expected_exit: AtomicBool,
     crashes: Mutex<Vec<Instant>>,
+    backup: Mutex<Option<(String, Arc<backup::Progress>)>>,
 }
 
 fn now_secs() -> u64 {
@@ -137,6 +138,7 @@ impl Instance {
             cpu_sample: Mutex::new(None),
             expected_exit: AtomicBool::new(false),
             crashes: Mutex::new(Vec::new()),
+            backup: Mutex::new(None),
         })
     }
 
@@ -210,6 +212,23 @@ impl Instance {
             created_at: r.created_at,
             last_error: r.last_error,
         }
+    }
+
+    pub fn backup_progress(&self) -> Option<BackupProgress> {
+        let slot = self.backup.lock().expect("backup lock");
+        slot.as_ref().map(|(name, p)| {
+            let total = p.total.load(Ordering::Relaxed);
+            BackupProgress {
+                name: name.clone(),
+                // A file growing during the backup must not read as more than 100%.
+                done_bytes: p.done.load(Ordering::Relaxed).min(total),
+                total_bytes: total,
+            }
+        })
+    }
+
+    pub fn disk_used(&self) -> u64 {
+        self.disk_bytes.load(Ordering::Relaxed)
     }
 
     pub fn stats(&self) -> ServerStats {
@@ -331,6 +350,10 @@ impl Manager {
         self.servers.read().expect("servers lock").get(&id).cloned().ok_or_else(|| not_found("server not found"))
     }
 
+    pub fn find_by_sftp_user(&self, user: &str) -> Option<Arc<Instance>> {
+        self.all().into_iter().find(|s| sftp_user(s.id).eq_ignore_ascii_case(user))
+    }
+
     pub fn all(&self) -> Vec<Arc<Instance>> {
         self.servers.read().expect("servers lock").values().cloned().collect()
     }
@@ -356,7 +379,7 @@ impl Manager {
 
     /// DNAT would silently shadow anything already bound here, including tailscaled's UDP port.
     fn validate_port(&self, port: u16, proto: Protocol) -> ApiResult<()> {
-        if port < 1024 || port == self.cfg.port {
+        if port < 1024 || port == self.cfg.port || port == SFTP_PORT {
             return Err(bad_request(format!("port {port} is reserved")));
         }
         if self.port_taken(port, proto) {
@@ -787,6 +810,20 @@ impl Manager {
 
     pub async fn create_backup(&self, inst: &Instance, name: &str) -> ApiResult<BackupInfo> {
         validate_name(name).map_err(bad_request)?;
+        let progress = Arc::new(backup::Progress::default());
+        {
+            let mut slot = inst.backup.lock().expect("backup lock");
+            if slot.is_some() {
+                return Err(conflict("a backup of this server is already running"));
+            }
+            *slot = Some((name.trim().to_string(), progress.clone()));
+        }
+        let result = self.run_backup(inst, name, progress).await;
+        *inst.backup.lock().expect("backup lock") = None;
+        result
+    }
+
+    async fn run_backup(&self, inst: &Instance, name: &str, progress: Arc<backup::Progress>) -> ApiResult<BackupInfo> {
         if matches!(inst.state(), ServerState::Running) && inst.record().flavor != Flavor::Bedrock {
             let _ = inst.send_stdin("save-all flush").await;
             tokio::time::sleep(Duration::from_secs(3)).await;
@@ -798,7 +835,7 @@ impl Manager {
         let target = archive.clone();
         let made = tokio::task::spawn_blocking(move || -> Result<u64> {
             let root = files::open_root(&data)?;
-            backup::create(&root, &target)?;
+            backup::create(&root, &target, &progress)?;
             Ok(std::fs::metadata(&target)?.len())
         })
         .await

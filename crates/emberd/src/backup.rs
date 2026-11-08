@@ -11,20 +11,58 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::UNIX_EPOCH;
 
 const MAX_DEPTH: usize = 128;
 
-pub fn create(root: &Dir, dest: &Path) -> Result<()> {
+/// Shared with the API so the panel can watch a backup while it runs.
+#[derive(Debug, Default)]
+pub struct Progress {
+    pub done: AtomicU64,
+    pub total: AtomicU64,
+}
+
+struct CountingReader<'a, R> {
+    inner: R,
+    progress: &'a Progress,
+}
+
+impl<R: Read> Read for CountingReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.progress.done.fetch_add(n as u64, Ordering::Relaxed);
+        Ok(n)
+    }
+}
+
+/// Adds up regular files the same way the archive walk finds them.
+fn measure(dir: &Dir, depth: usize) -> u64 {
+    if depth > MAX_DEPTH {
+        return 0;
+    }
+    let Ok(entries) = dir.entries() else { return 0 };
+    entries
+        .flatten()
+        .map(|e| match e.file_type() {
+            Ok(k) if k.is_dir() => dir.open_dir_nofollow(e.file_name()).map_or(0, |d| measure(&d, depth + 1)),
+            Ok(k) if k.is_file() => e.metadata().map_or(0, |m| m.len()),
+            _ => 0,
+        })
+        .sum()
+}
+
+pub fn create(root: &Dir, dest: &Path, progress: &Progress) -> Result<()> {
+    progress.total.store(measure(root, 0), Ordering::Relaxed);
     let out = std::fs::File::create(dest).context("create backup file")?;
     let mut tar = tar::Builder::new(GzEncoder::new(out, Compression::fast()));
     tar.follow_symlinks(false);
-    add_dir(&mut tar, root, Path::new(""), 0)?;
+    add_dir(&mut tar, root, Path::new(""), 0, progress)?;
     tar.into_inner()?.finish()?.sync_all()?;
     Ok(())
 }
 
-fn add_dir<W: io::Write>(tar: &mut tar::Builder<W>, dir: &Dir, prefix: &Path, depth: usize) -> Result<()> {
+fn add_dir<W: io::Write>(tar: &mut tar::Builder<W>, dir: &Dir, prefix: &Path, depth: usize, progress: &Progress) -> Result<()> {
     if depth > MAX_DEPTH {
         bail!("directory tree is too deep to back up");
     }
@@ -40,7 +78,7 @@ fn add_dir<W: io::Write>(tar: &mut tar::Builder<W>, dir: &Dir, prefix: &Path, de
             h.set_mode(0o755);
             tar.append_data(&mut h, &rel, io::empty())?;
             let sub = dir.open_dir_nofollow(&name)?;
-            add_dir(tar, &sub, &rel, depth + 1)?;
+            add_dir(tar, &sub, &rel, depth + 1, progress)?;
         } else if kind.is_file() {
             // A file can vanish or change type mid-walk; a live server makes that normal.
             let Ok(file) = files::open_regular(dir, &name) else { continue };
@@ -54,7 +92,7 @@ fn add_dir<W: io::Write>(tar: &mut tar::Builder<W>, dir: &Dir, prefix: &Path, de
             h.set_mtime(mtime.map_or(0, |d| d.as_secs()));
             // Exactly `size` bytes even if the server changes the file during the copy.
             let body = (&file).take(size).chain(io::repeat(0)).take(size);
-            tar.append_data(&mut h, &rel, body)?;
+            tar.append_data(&mut h, &rel, CountingReader { inner: body, progress })?;
         }
     }
     Ok(())
@@ -107,7 +145,11 @@ mod tests {
 
         let root = files::open_root(data.path()).unwrap();
         let archive = store.path().join("b.tar.gz");
-        create(&root, &archive).unwrap();
+        let progress = Progress::default();
+        create(&root, &archive, &progress).unwrap();
+        // Only level.dat counts: the symlink's target is outside and never archived.
+        assert_eq!(progress.total.load(Ordering::Relaxed), 5);
+        assert_eq!(progress.done.load(Ordering::Relaxed), 5);
 
         std::fs::write(data.path().join("junk"), "junk").unwrap();
         restore(&root, &archive, me(), 1 << 20).unwrap();
