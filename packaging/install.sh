@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Installs or updates the Ember daemon on a Linux machine.
 #
-#   curl -fsSL https://burnet01.github.io/TESTME/install.sh | sudo bash
+#   curl -fsSL https://burnet01.github.io/ember-daemon/install.sh | sudo bash
 #
 # Options, passed after `sudo bash -s --`:
 #   --auth-key KEY  Log in to Tailscale with this key, so nobody has to open a login link.
@@ -14,7 +14,7 @@
 # Everything is inside main so a download cut off halfway can't run part of the script.
 set -euo pipefail
 
-RELEASES=https://github.com/burnet01/TESTME/releases/latest/download
+RELEASES=https://github.com/burnet01/ember-daemon/releases/latest/download
 ASSET=emberd-linux-x86_64
 CONFIG=/etc/ember/config.toml
 UNIT=/etc/systemd/system/emberd.service

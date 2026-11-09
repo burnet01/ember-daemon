@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/ember-proto", "crates/emberd", "crates/ember-probe", "crates/ember-panel"]
+members = ["crates/ember-proto", "crates/emberd", "crates/ember-probe"]
 
 [workspace.package]
 version = "0.2.0"

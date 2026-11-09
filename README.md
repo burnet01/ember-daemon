@@ -1,19 +1,19 @@
 # Ember
 
-A private, Docker-free game server panel with a native desktop app, managed entirely over Tailscale.
+A Docker-free game server daemon for Linux, managed entirely over Tailscale by Ember Panel, a desktop app kept in a separate private repo.
 
-- **Ember Panel** (`crates/ember-panel`): native desktop app built with Rust and Slint. It finds your nodes through Tailscale.
 - **emberd** (`crates/emberd`): Linux daemon that installs, sandboxes and runs game servers.
 - **ember-probe** (`crates/ember-probe`): test program that attempts sandbox escapes in CI.
+- **ember-proto** (`crates/ember-proto`): the API types the daemon and panel share.
 
 Minecraft is supported: Paper, Vanilla, Fabric, Forge and Bedrock.
 
 ## Install a node
 
-The steps are also at <https://burnet01.github.io/TESTME/>. On x86_64 Linux with systemd and cgroup v2, run:
+The steps are also at <https://burnet01.github.io/ember-daemon/>. On x86_64 Linux with systemd and cgroup v2, run:
 
 ```sh
-curl -fsSL https://burnet01.github.io/TESTME/install.sh | sudo bash
+curl -fsSL https://burnet01.github.io/ember-daemon/install.sh | sudo bash
 ```
 
 It installs `nftables`, `iproute2` and Tailscale if they're missing, shows a login link if the machine isn't on Tailscale, and makes that machine's Tailscale login the owner. To set a different owner, add `-s -- --owner you@example.com` after `bash`.
@@ -21,7 +21,7 @@ It installs `nftables`, `iproute2` and Tailscale if they're missing, shows a log
 To skip the login link, for example on GitHub Actions or a new cloud machine, include a Tailscale auth key:
 
 ```sh
-curl -fsSL https://burnet01.github.io/TESTME/install.sh | sudo bash -s -- --auth-key tskey-auth-YOUR-KEY
+curl -fsSL https://burnet01.github.io/ember-daemon/install.sh | sudo bash -s -- --auth-key tskey-auth-YOUR-KEY
 ```
 
 Use a single-use key. On GitHub Actions, put it in a repository secret and pass `--auth-key "$TS_AUTHKEY"`, because workflow files are readable by anyone who can see the repo. A key with tags also needs `--owner`.
@@ -32,9 +32,7 @@ Check a node with `sudo emberd doctor`.
 
 ## Run the panel
 
-Download [`ember-panel.exe`](https://github.com/burnet01/TESTME/releases/latest/download/ember-panel.exe), or run `cargo run --release -p ember-panel`, on a machine logged in to Tailscale as that same account. Nodes appear automatically.
-
-`ember-panel --demo` shows the interface with sample data and makes no network connections.
+Open Ember Panel on a device logged in to Tailscale as that same account. Nodes appear automatically.
 
 ## File transfer
 
@@ -54,7 +52,6 @@ The test suites never run automatically, to keep GitHub Actions usage low. Start
 | `sandbox` | `ember-probe` tries real attacks from inside a real sandbox, and tests the memory and process limits |
 | `e2e-vanilla` | Boots a real server, pings it from a separate network namespace, and attacks the API |
 | `e2e-all-flavors` | The same, plus Paper, Fabric and Forge boots |
-| `panel` | Builds and tests the Windows app |
 | `release` | Builds the release daemon |
 | `tailnet-test` | Runs a temporary node on your tailnet for 20 minutes to try the panel, then leaves. Needs the `TS_AUTHKEY` (ephemeral) and `EMBER_OWNER` secrets. Not for hosting |
 
@@ -62,7 +59,7 @@ CI runners are not on a tailnet, so the end-to-end test replaces tailscaled with
 
 ## Publishing
 
-Pushing a version tag such as `v0.2.0` runs the `Publish` workflow. It builds both programs, runs the unit, sandbox and Vanilla end-to-end tests on the exact daemon being released, and creates a release only if they pass. Nodes pick it up that night, and the install command and download link always use the latest release. The `Website` workflow updates the site in a few seconds when `site/` or `packaging/install.sh` changes.
+Pushing a version tag such as `v0.2.0` runs the `Publish` workflow. It builds the daemon, runs the unit, sandbox and Vanilla end-to-end tests on the exact file being released, and creates a release only if they pass. Nodes pick it up that night, and the install command always uses the latest release. The `Website` workflow updates the site in a few seconds when `site/` or `packaging/install.sh` changes.
 
 ## Development
 

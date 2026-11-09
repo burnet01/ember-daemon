@@ -1,7 +1,7 @@
 name: Publish
 
-# Tests and builds the daemon and panel and publishes them as a release. Nodes install
-# releases by themselves, so nothing is published unless the full tests pass on the exact
+# Tests and builds the daemon and publishes it as a release. Nodes install releases by
+# themselves, so nothing is published unless the full tests pass on the exact
 # daemon being released. Runs only when a version tag is pushed or by hand.
 on:
   push:
@@ -48,24 +48,9 @@ jobs:
           path: emberd-linux-x86_64
           retention-days: 1
 
-  panel:
-    name: Windows panel
-    runs-on: windows-latest
-    timeout-minutes: 25
-    steps:
-      - uses: actions/checkout@v4
-      - run: rustup toolchain install stable --profile minimal; rustup default stable
-      - run: cargo test -p ember-panel
-      - run: cargo build --release -p ember-panel
-      - uses: actions/upload-artifact@v4
-        with:
-          name: panel
-          path: target/release/ember-panel.exe
-          retention-days: 1
-
   release:
     name: Publish the release
-    needs: [daemon, panel]
+    needs: daemon
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -80,7 +65,6 @@ jobs:
           TAG: ${{ inputs.version || github.ref_name }}
         run: |
           sha256sum emberd-linux-x86_64 > emberd-linux-x86_64.sha256
-          sha256sum ember-panel.exe > ember-panel.exe.sha256
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
             --title "Ember $TAG" --generate-notes --latest \
-            emberd-linux-x86_64 emberd-linux-x86_64.sha256 ember-panel.exe ember-panel.exe.sha256
+            emberd-linux-x86_64 emberd-linux-x86_64.sha256

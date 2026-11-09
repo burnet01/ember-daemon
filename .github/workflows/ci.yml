@@ -15,7 +15,6 @@ on:
           - sandbox
           - e2e-vanilla
           - e2e-all-flavors
-          - panel
           - release
           - tailnet-test
 
@@ -147,30 +146,6 @@ jobs:
         run: |
           sudo systemctl stop emberd || true
           sudo tailscale logout || true
-
-  panel:
-    name: Desktop app (Windows)
-    if: inputs.suite == 'panel'
-    runs-on: windows-latest
-    timeout-minutes: 25
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: windows-${{ hashFiles('Cargo.lock') }}
-          restore-keys: windows-
-      - run: rustup toolchain install stable --profile minimal; rustup default stable
-      - run: cargo test -p ember-panel
-      - run: cargo build --release -p ember-panel
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ember-panel-windows
-          path: target/release/ember-panel.exe
-          retention-days: 7
 
   release:
     name: Daemon release build

@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-const RELEASE_BASE: &str = "https://github.com/burnet01/TESTME/releases/latest/download";
+const RELEASE_BASE: &str = "https://github.com/burnet01/ember-daemon/releases/latest/download";
 const ASSET: &str = "emberd-linux-x86_64";
 const SERVICE: &str = "emberd";
 /// How long the daemon gets to finish backups and installs before it is restarted anyway.
