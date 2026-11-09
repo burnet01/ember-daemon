@@ -413,6 +413,11 @@ impl Manager {
         })
     }
 
+    /// Memory limits added up across this node's servers, leaving out `except`.
+    pub fn memory_allocated_mb(&self, except: Option<Uuid>) -> u64 {
+        self.all().iter().filter(|s| Some(s.id) != except).map(|s| s.record().limits.memory_mb).sum()
+    }
+
     fn port_reserved(&self, port: u16) -> bool {
         port < 1024 || port == self.cfg.port || port == SFTP_PORT
     }
@@ -441,6 +446,7 @@ impl Manager {
         req.limits.validate().map_err(bad_request)?;
         let cap = crate::node::capacity(&self.cfg.data_dir);
         crate::node::check_limits(&req.limits, &cap, cap.disk_free_mb).map_err(bad_request)?;
+        crate::node::check_memory(req.limits.memory_mb, self.memory_allocated_mb(None), cap.memory_mb, req.allow_overallocate).map_err(bad_request)?;
         if !req.eula_accepted {
             return Err(bad_request("you must accept the Minecraft EULA to create a server"));
         }
@@ -746,6 +752,8 @@ impl Manager {
     }
 
     pub async fn update_settings(&self, inst: &Instance, req: UpdateServer) -> ApiResult<()> {
+        // Shared with create, so two changes at once can't both claim the same free memory.
+        let _creating = self.creating.lock().expect("create lock");
         if let Some(n) = &req.name {
             validate_name(n).map_err(bad_request)?;
         }
@@ -753,6 +761,10 @@ impl Manager {
             l.validate().map_err(bad_request)?;
             let cap = crate::node::capacity(&self.cfg.data_dir);
             crate::node::check_limits(l, &cap, cap.disk_total_mb).map_err(bad_request)?;
+            // Only an increase is checked, so an overbooked server can still change other settings.
+            if l.memory_mb > inst.record().limits.memory_mb {
+                crate::node::check_memory(l.memory_mb, self.memory_allocated_mb(Some(inst.id)), cap.memory_mb, req.allow_overallocate).map_err(bad_request)?;
+            }
         }
         inst.update(|r| {
             if let Some(n) = req.name {

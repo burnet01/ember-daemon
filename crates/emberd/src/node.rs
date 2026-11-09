@@ -80,7 +80,19 @@ pub fn check_limits(l: &ember_proto::Limits, cap: &Capacity, disk_max_mb: u64) -
     Ok(())
 }
 
-pub fn stats(data_dir: &Path, cpu_percent: f32, total: u32, running: u32) -> NodeStats {
+/// Keeps the memory assigned across a node's servers within what the machine has, unless
+/// the operator chose to overbook it. `others_mb` is every other server's limit added up.
+pub fn check_memory(requested_mb: u64, others_mb: u64, machine_mb: u64, allow_overallocate: bool) -> Result<(), String> {
+    if allow_overallocate || others_mb.saturating_add(requested_mb) <= machine_mb {
+        return Ok(());
+    }
+    Err(format!(
+        "this node has {} MB of memory left to assign, out of {machine_mb} MB. Lower another server or allow overallocation",
+        machine_mb.saturating_sub(others_mb)
+    ))
+}
+
+pub fn stats(data_dir: &Path, cpu_percent: f32, total: u32, running: u32, memory_allocated_mb: u64) -> NodeStats {
     let (memory_used, memory_total) = std::fs::read_to_string("/proc/meminfo").map_or((0, 0), |t| parse_meminfo(&t));
     let (disk_used, disk_total) = statvfs(data_dir);
     let first = |p: &str| -> f64 {
@@ -96,6 +108,7 @@ pub fn stats(data_dir: &Path, cpu_percent: f32, total: u32, running: u32) -> Nod
         uptime_secs: first("/proc/uptime") as u64,
         servers_total: total,
         servers_running: running,
+        memory_allocated_mb,
     }
 }
 
@@ -172,6 +185,15 @@ mod tests {
         assert!(check_limits(&ember_proto::Limits { cpu_percent: 900, ..ok }, &cap, cap.disk_free_mb).is_err());
         assert!(check_limits(&ember_proto::Limits { disk_mb: 40_001, ..ok }, &cap, cap.disk_free_mb).is_err());
         assert!(check_limits(&ember_proto::Limits { disk_mb: 90_000, ..ok }, &cap, cap.disk_total_mb).is_ok());
+    }
+
+    #[test]
+    fn assigned_memory_stays_within_the_machine_unless_overbooked() {
+        assert!(check_memory(8_000, 8_000, 16_000, false).is_ok(), "exactly full is allowed");
+        assert!(check_memory(8_001, 8_000, 16_000, false).is_err());
+        assert!(check_memory(1, 20_000, 16_000, false).is_err(), "already overbooked");
+        assert!(check_memory(8_001, 8_000, 16_000, true).is_ok(), "the operator chose to");
+        assert!(check_memory(u64::MAX, u64::MAX, 16_000, false).is_err(), "a sum can't wrap around");
     }
 
     #[test]

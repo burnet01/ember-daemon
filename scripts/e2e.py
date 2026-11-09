@@ -10,6 +10,7 @@ import argparse
 import base64
 import http.client
 import http.server
+import io
 import json
 import os
 import pathlib
@@ -25,6 +26,7 @@ import tempfile
 import threading
 import time
 import urllib.parse
+import zipfile
 
 NODE_IP = "127.0.0.2"
 OWNER_IP = "127.0.0.5"
@@ -294,12 +296,27 @@ def test_full_server(version, data_root):
         return
     code, _ = api("PATCH", f"/v1/servers/{sid}", {"limits": {**LIMITS, "memory_mb": 4000000}})
     check("settings cannot exceed this machine either", code == 400, str(code))
+    # This server already holds 2048 MB, so a second one the machine's full size won't fit.
+    machine_mb = api("GET", "/v1/node/stats")[1]["memory_total"] // (1 << 20)
+    big = {**LIMITS, "memory_mb": machine_mb}
+    check("stats add up assigned memory", api("GET", "/v1/node/stats")[1]["memory_allocated_mb"] == 2048)
+    code, body = api("POST", "/v1/servers", {**req, "name": "too much", "limits": big})
+    check("assigning past the machine's memory is refused", code == 400, str(body))
+    code, body = api("PATCH", f"/v1/servers/{sid}", {"limits": {**LIMITS, "memory_mb": machine_mb + 1}, "allow_overallocate": True})
+    check("one server still can't pass the machine's size", code == 400, str(body))
+
     # 25565 belongs to the server above and another program holds 25566.
     with socket.create_server(("0.0.0.0", 25566)):
-        code, dup = api("POST", "/v1/servers", {**req, "name": "dup"})
+        code, dup = api("POST", "/v1/servers", {**req, "name": "dup", "limits": big, "allow_overallocate": True})
+    check("overallocation lets it through when chosen", code == 201, str(dup))
     check("a taken port moves to the next free one", code == 201 and dup["port"] == 25567, str(dup))
     if code == 201:
         wait_state(dup["id"], ("offline", "install_failed"), 420)
+        check("assigned memory can be past the machine", api("GET", "/v1/node/stats")[1]["memory_allocated_mb"] == 2048 + machine_mb)
+        code, _ = api("PATCH", f"/v1/servers/{sid}", {"name": "E2E Vanilla", "limits": LIMITS})
+        check("an overbooked node can still change other settings", code == 200, str(code))
+        code, _ = api("PATCH", f"/v1/servers/{sid}", {"limits": {**LIMITS, "memory_mb": 2304}})
+        check("raising memory on an overbooked node is refused", code == 400, str(code))
         check("the moved server is removed", api("DELETE", f"/v1/servers/{dup['id']}", timeout=120)[0] == 204)
 
     check("start is accepted", api("POST", f"/v1/servers/{sid}/power", {"action": "start"})[0] == 202)
@@ -369,6 +386,27 @@ def test_files(sid, data, uid):
     check("/etc/shadow is untouched", shadow.read_bytes() == before)
     check("nothing was created in /etc", not pathlib.Path("/etc/pwn").exists())
     check("root cannot be deleted", api("DELETE", f"{base}?path=")[0] == 400)
+
+    zipped = data / "zipme"
+    (zipped / "sub").mkdir(parents=True)
+    (zipped / "a.txt").write_text("hello")
+    (zipped / "sub" / "b.txt").write_text("nested")
+    os.symlink("/etc/shadow", zipped / "evil")
+    os.symlink("/etc", zipped / "evildir")
+    os.mkfifo(zipped / "pipe")
+    (zipped / "..\\..\\evil.bat").write_text("x")
+    code, blob = api("GET", f"{base}/download-folder?path=zipme", timeout=30)
+    check("a folder downloads as a zip", code == 200 and isinstance(blob, bytes) and blob[:2] == b"PK", str(code))
+    if code == 200:
+        archive = zipfile.ZipFile(io.BytesIO(blob))
+        names = sorted(archive.namelist())
+        check("the zip holds only safe, regular files", names == ["zipme/", "zipme/a.txt", "zipme/sub/", "zipme/sub/b.txt"], str(names))
+        check("zipped content is correct", archive.read("zipme/sub/b.txt") == b"nested")
+    check("zipping through a dir symlink is refused", api("GET", f"{base}/download-folder?path=evildir")[0] == 400)
+    check("zipping outside the server is refused", api("GET", f"{base}/download-folder?path={q('../')}")[0] == 400)
+    check("zipping a file is refused", api("GET", f"{base}/download-folder?path=zipme/a.txt")[0] == 400)
+    check("no zip is left behind", not list(data.parent.glob(".zip-*")))
+    shutil.rmtree(zipped)
 
     code, _ = api("DELETE", f"{base}?path=evildir")
     check("deleting a dir symlink works", code == 204 and pathlib.Path("/etc/passwd").exists())
@@ -518,9 +556,12 @@ def test_backups_and_power(sid, data):
     (data / "marker.txt").write_text("changed while online")
     live = {}
     restoring = threading.Thread(target=lambda: live.update(code=api("POST", f"{base}/backups/{backup['id']}/restore", timeout=300)[0]))
+    began = time.time()
     restoring.start()
-    time.sleep(1)
-    check("backup is refused during a restore", api("POST", f"{base}/backups", {"name": "late"}, timeout=60)[0] == 409)
+    # Soon after it starts, because stopping a small test world can take under a second.
+    time.sleep(0.2)
+    late = api("POST", f"{base}/backups", {"name": "late"}, timeout=60)[0]
+    check("backup is refused during a restore", late == 409, f"got {late} after {time.time() - began:.2f}s, restore done: {not restoring.is_alive()}")
     restoring.join()
     check("a running server can be restored", live.get("code") == 204, str(live))
     check("the live restore put the backup back", (data / "marker.txt").read_text() == "original")

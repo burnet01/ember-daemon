@@ -37,7 +37,7 @@ impl<R: Read> Read for CountingReader<'_, R> {
 }
 
 /// Adds up regular files the same way the archive walk finds them.
-fn measure(dir: &Dir, depth: usize) -> u64 {
+pub fn measure(dir: &Dir, depth: usize) -> u64 {
     if depth > MAX_DEPTH {
         return 0;
     }
@@ -93,6 +93,48 @@ fn add_dir<W: io::Write>(tar: &mut tar::Builder<W>, dir: &Dir, prefix: &Path, de
             // Exactly `size` bytes even if the server changes the file during the copy.
             let body = (&file).take(size).chain(io::repeat(0)).take(size);
             tar.append_data(&mut h, &rel, CountingReader { inner: body, progress })?;
+        }
+    }
+    Ok(())
+}
+
+/// A server controls its file names, and a name like `..\\..\\evil` could write outside the
+/// target folder when the zip is extracted on the operator's Windows machine.
+fn zip_safe_name(name: &str) -> bool {
+    !name.contains(['\\', ':', '/']) && !name.chars().any(char::is_control)
+}
+
+/// Writes `dir` to `out` as a zip whose entries start with `top`, for downloading a folder.
+/// Only regular files and directories are included, so links can't pull in anything else.
+pub fn zip_dir(dir: &Dir, top: &str, out: &mut std::fs::File) -> Result<()> {
+    let mut zip = zip::ZipWriter::new(out);
+    add_to_zip(&mut zip, dir, top, 0)?;
+    zip.finish()?;
+    Ok(())
+}
+
+fn add_to_zip<W: io::Write + io::Seek>(zip: &mut zip::ZipWriter<W>, dir: &Dir, prefix: &str, depth: usize) -> Result<()> {
+    if depth > MAX_DEPTH {
+        bail!("directory tree is too deep to zip");
+    }
+    // Fastest compression: this is for handing files over, not for storing them.
+    let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated).compression_level(Some(1));
+    zip.add_directory(format!("{prefix}/"), options)?;
+    for entry in dir.entries()? {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str().filter(|n| zip_safe_name(n)) else { continue };
+        let rel = format!("{prefix}/{name}");
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            add_to_zip(zip, &dir.open_dir_nofollow(name)?, &rel, depth + 1)?;
+        } else if kind.is_file() {
+            // A file can vanish or change type mid-walk; a live server makes that normal.
+            let Ok(file) = files::open_regular(dir, Path::new(name)) else { continue };
+            let size = file.metadata()?.len();
+            zip.start_file(rel, options.large_file(size >= u64::from(u32::MAX)))?;
+            // Capped, so a server appending as fast as it can't make this run forever.
+            io::copy(&mut (&file).take(size), zip)?;
         }
     }
     Ok(())
@@ -158,6 +200,34 @@ mod tests {
         assert!(!data.path().join("junk").exists(), "restore must replace, not merge");
         assert!(std::fs::symlink_metadata(data.path().join("evil")).is_err(), "links must not survive");
         assert_eq!(std::fs::read_to_string(outside.path().join("secret")).unwrap(), "s3cret");
+    }
+
+    #[test]
+    fn zip_holds_only_safe_regular_files() {
+        let (data, outside, store) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        std::fs::write(outside.path().join("secret"), "s3cret").unwrap();
+        std::fs::create_dir_all(data.path().join("world/region")).unwrap();
+        std::fs::write(data.path().join("world/level.dat"), "level").unwrap();
+        std::fs::write(data.path().join("world/region/r.0.0.mca"), "chunk").unwrap();
+        symlink(outside.path().join("secret"), data.path().join("world/evil")).unwrap();
+        symlink(outside.path(), data.path().join("world/evildir")).unwrap();
+        std::fs::write(data.path().join("world/..\\..\\evil.bat"), "x").unwrap();
+        std::fs::write(data.path().join("world/C:evil"), "x").unwrap();
+
+        let root = files::open_root(data.path()).unwrap();
+        let dir = root.open_dir_nofollow("world").unwrap();
+        let path = store.path().join("w.zip");
+        let mut out = std::fs::File::options().read(true).write(true).create_new(true).open(&path).unwrap();
+        zip_dir(&dir, "world", &mut out).unwrap();
+        drop(out);
+
+        let mut zip = zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
+        let mut names: Vec<String> = zip.file_names().map(str::to_string).collect();
+        names.sort();
+        assert_eq!(names, ["world/", "world/level.dat", "world/region/", "world/region/r.0.0.mca"]);
+        let mut text = String::new();
+        zip.by_name("world/region/r.0.0.mca").unwrap().read_to_string(&mut text).unwrap();
+        assert_eq!(text, "chunk");
     }
 
     #[test]

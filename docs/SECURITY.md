@@ -44,7 +44,7 @@ The installer can log in to Tailscale with a key from `--auth-key` or `TS_AUTHKE
 
 ## The daemon handling hostile files
 
-The daemon runs as root and handles files a compromised server controls. All file, backup and restore access goes through `cap-std`, which resolves paths beneath the server's directory and refuses to leave it. FIFOs cannot hang it, links are never archived or restored, and uploads are staged outside the tree and renamed in.
+The daemon runs as root and handles files a compromised server controls. All file, backup and restore access goes through `cap-std`, which resolves paths beneath the server's directory and refuses to leave it. FIFOs cannot hang it, links are never archived or restored, and uploads are staged outside the tree and renamed in. Folder downloads leave out file names that could escape the target folder when extracted on Windows.
 
 Console output is sanitized so a server cannot send terminal control sequences to the panel.
 

@@ -99,6 +99,9 @@ pub struct CreateServer {
     /// Starts the server once its install finishes, even if the panel has closed.
     #[serde(default)]
     pub start_after_install: bool,
+    /// Lets the memory assigned across this node's servers go past what the machine has.
+    #[serde(default)]
+    pub allow_overallocate: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -107,6 +110,8 @@ pub struct UpdateServer {
     pub limits: Option<Limits>,
     pub autostart: Option<bool>,
     pub restart_on_crash: Option<bool>,
+    #[serde(default)]
+    pub allow_overallocate: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -239,6 +244,9 @@ pub struct NodeStats {
     pub uptime_secs: u64,
     pub servers_total: u32,
     pub servers_running: u32,
+    /// Memory limits of all servers on this node added together.
+    #[serde(default)]
+    pub memory_allocated_mb: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

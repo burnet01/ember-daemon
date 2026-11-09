@@ -2,6 +2,7 @@
 //! route passes through `guard`, including health checks.
 
 use crate::auth::{self, SelfInfo, Tailscale};
+use crate::backup;
 use crate::error::{bad_request, conflict, ApiErr, ApiResult};
 use crate::files;
 use crate::install;
@@ -90,6 +91,7 @@ pub fn router(app: AppState) -> Router {
         .route("/files/mkdir", post(make_dir))
         .route("/files/rename", post(rename_file))
         .route("/files/download", get(download_file))
+        .route("/files/download-folder", get(download_folder))
         .route("/files/upload", put(upload_file).layer(DefaultBodyLimit::disable()))
         .route("/backups", get(list_backups).post(create_backup))
         .route("/backups/progress", get(backup_progress))
@@ -141,7 +143,7 @@ async fn node_stats(State(app): State<AppState>) -> Json<NodeStats> {
     let all = app.mgr.all();
     let running = all.iter().filter(|s| matches!(s.state(), ServerState::Running | ServerState::Starting)).count();
     let cpu = app.mgr.node_cpu_percent();
-    Json(node::stats(&app.mgr.cfg.data_dir, cpu, all.len() as u32, running as u32))
+    Json(node::stats(&app.mgr.cfg.data_dir, cpu, all.len() as u32, running as u32, app.mgr.memory_allocated_mb(None)))
 }
 
 async fn versions(State(app): State<AppState>, Path(flavor): Path<Flavor>) -> ApiResult<Json<Vec<GameVersion>>> {
@@ -355,6 +357,36 @@ async fn download_file(State(app): State<AppState>, Path(id): Path<Uuid>, Query(
         let f = files::open_regular(&root, &path)?;
         let size = f.metadata()?.len();
         Ok((f.into_std(), size))
+    })
+    .await?;
+    let stream = ReaderStream::new(tokio::fs::File::from_std(file));
+    Ok(([(header::CONTENT_LENGTH, size.to_string())], Body::from_stream(stream)).into_response())
+}
+
+/// Zips outside the server's tree, in a file with no name, so it needs no cleanup whatever
+/// happens and the server can never see or tamper with it.
+async fn download_folder(State(app): State<AppState>, Path(id): Path<Uuid>, Query(q): Query<PathQuery>) -> ApiResult<Response> {
+    use cap_fs_ext::DirExt;
+    use std::io::Seek;
+    use std::os::unix::fs::OpenOptionsExt;
+    inst(&app, id)?;
+    let (data, server_dir) = (app.mgr.data_dir(id), app.mgr.server_dir(id));
+    let disk = app.mgr.cfg.data_dir.clone();
+    let (file, size) = file_op(move || {
+        let root = files::open_root(&data)?;
+        let path = files::clean_nonroot(&q.path)?;
+        let dir = root.open_dir_nofollow(&path).context("open folder")?;
+        let top = path.file_name().and_then(|n| n.to_str()).context("invalid folder name")?.to_string();
+        if backup::measure(&dir, 0) / (1024 * 1024) > node::capacity(&disk).disk_free_mb {
+            anyhow::bail!("not enough free disk space to zip this folder");
+        }
+        let tmp = server_dir.join(format!(".zip-{}", Uuid::new_v4()));
+        let mut out = std::fs::File::options().read(true).write(true).create_new(true).mode(0o600).open(&tmp).context("create zip")?;
+        std::fs::remove_file(&tmp).context("hide zip")?;
+        backup::zip_dir(&dir, &top, &mut out)?;
+        let size = out.seek(std::io::SeekFrom::End(0))?;
+        out.rewind()?;
+        Ok((out, size))
     })
     .await?;
     let stream = ReaderStream::new(tokio::fs::File::from_std(file));
