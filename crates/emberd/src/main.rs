@@ -128,11 +128,12 @@ async fn serve(config: std::path::PathBuf) -> anyhow::Result<()> {
 
     sandbox::cgroup::prepare_root()?;
     sandbox::cgroup::sweep_stale();
-    sandbox::net::init().await?;
+    sandbox::net::init(&cfg.tailnet_interface).await?;
 
     let mgr = manager::Manager::load(cfg)?;
-    mgr.sync_links().await.context("restore server links")?;
+    mgr.sync_paths().await.context("restore server links")?;
     mgr.spawn_background();
+    mgr.find_public_ip();
 
     {
         let (mgr, ts, me) = (mgr.clone(), ts.clone(), me.clone());

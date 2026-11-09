@@ -29,7 +29,7 @@ pub fn addrs(index: u32) -> (Ipv4Addr, Ipv4Addr) {
     (Ipv4Addr::from(base + 1), Ipv4Addr::from(base + 2))
 }
 
-fn ruleset() -> String {
+fn ruleset(tailnet: &str) -> String {
     format!(
         r#"table inet ember {{}}
 delete table inet ember
@@ -37,10 +37,13 @@ table inet ember {{
   map tcp_ports {{ type inet_service : ipv4_addr; }}
   map udp_ports {{ type inet_service : ipv4_addr; }}
   set links {{ type ipv4_addr . ipv4_addr . inet_service; }}
+  map tailnet_in {{ type ipv4_addr . inet_service : ipv4_addr; }}
+  set egress {{ type ipv4_addr . ipv4_addr . inet_service; }}
 
   chain prerouting {{
     type nat hook prerouting priority -100; policy accept;
     iifname "embh*" return
+    iifname "{tailnet}" meta nfproto ipv4 dnat ip to ip saddr . tcp dport map @tailnet_in
     meta nfproto ipv4 fib daddr type local dnat ip to tcp dport map @tcp_ports
     meta nfproto ipv4 fib daddr type local dnat ip to udp dport map @udp_ports
   }}
@@ -68,6 +71,7 @@ table inet ember {{
     oifname "embh*" counter drop
     iifname "embh*" ct state established,related accept
     iifname "embh*" meta nfproto ipv6 counter drop
+    iifname "embh*" ip saddr . ip daddr . tcp dport @egress accept
     iifname "embh*" ip daddr {{ {BLOCKED_V4} }} counter drop
     iifname "embh*" accept
   }}
@@ -106,9 +110,9 @@ async fn nft(script: &str) -> Result<()> {
 }
 
 /// Installs the firewall atomically and clears leftovers from a previous run.
-pub async fn init() -> Result<()> {
+pub async fn init(tailnet: &str) -> Result<()> {
     tokio::fs::write("/proc/sys/net/ipv4/ip_forward", "1").await.context("enable IPv4 forwarding")?;
-    nft(&ruleset()).await.context("install firewall")?;
+    nft(&ruleset(tailnet)).await.context("install firewall")?;
     allow_through_iptables().await;
     sweep_stale().await;
     Ok(())
@@ -164,12 +168,27 @@ pub async fn offline_down(index: u32) {
 }
 
 /// Replaces the allowed server-to-server connections: (from, to, port on `to`).
-pub async fn set_links(links: &[(Ipv4Addr, Ipv4Addr, u16)]) -> Result<()> {
-    let mut script = String::from("flush set inet ember links\n");
-    if !links.is_empty() {
-        let items: Vec<String> = links.iter().map(|(a, b, p)| format!("{a} . {b} . {p}")).collect();
-        script.push_str(&format!("add element inet ember links {{ {} }}\n", items.join(", ")));
-    }
+/// Everything that lets a server talk past its own sandbox, replaced in one go.
+#[derive(Debug, Default)]
+pub struct Paths {
+    /// From one server to another on this node: (from, to, port on `to`).
+    pub links: Vec<(Ipv4Addr, Ipv4Addr, u16)>,
+    /// Into a server over Tailscale: (peer, port, server's sandbox address).
+    pub tailnet_in: Vec<(Ipv4Addr, u16, Ipv4Addr)>,
+    /// Out of a server to a Tailscale address: (server's sandbox address, peer, port).
+    pub egress: Vec<(Ipv4Addr, Ipv4Addr, u16)>,
+}
+
+pub async fn set_paths(paths: &Paths) -> Result<()> {
+    let mut script = String::from("flush set inet ember links\nflush map inet ember tailnet_in\nflush set inet ember egress\n");
+    let mut add = |what: &str, items: Vec<String>| {
+        if !items.is_empty() {
+            script.push_str(&format!("add element inet ember {what} {{ {} }}\n", items.join(", ")));
+        }
+    };
+    add("links", paths.links.iter().map(|(a, b, p)| format!("{a} . {b} . {p}")).collect());
+    add("tailnet_in", paths.tailnet_in.iter().map(|(peer, p, to)| format!("{peer} . {p} : {to}")).collect());
+    add("egress", paths.egress.iter().map(|(a, b, p)| format!("{a} . {b} . {p}")).collect());
     nft(&script).await
 }
 
@@ -245,10 +264,14 @@ mod tests {
 
     #[test]
     fn firewall_blocks_the_admin_plane() {
-        let r = ruleset();
+        let r = ruleset("tailscale0");
         for net in ["100.64.0.0/10", "169.254.0.0/16", "192.168.0.0/16", "10.0.0.0/8"] {
             assert!(r.contains(net), "missing {net}");
         }
         assert!(r.contains("iifname \"embh*\" counter drop"), "host input must be denied");
+        // Allowed Tailscale paths are checked before the blanket block, and only by exact entry.
+        let egress = r.find("@egress accept").unwrap();
+        assert!(egress < r.find("100.64.0.0/10").unwrap(), "egress must come before the tailnet block");
+        assert!(r.contains("iifname \"tailscale0\" meta nfproto ipv4 dnat ip to ip saddr . tcp dport map @tailnet_in"));
     }
 }

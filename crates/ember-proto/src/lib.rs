@@ -125,6 +125,13 @@ pub struct UpdateServer {
     pub links: Option<Vec<Uuid>>,
     #[serde(default)]
     pub group: Option<String>,
+    /// Tailscale addresses allowed to reach a private server's port through this node's
+    /// Tailscale address, like a proxy on another node.
+    #[serde(default)]
+    pub tailnet_allow: Option<Vec<std::net::Ipv4Addr>>,
+    /// Tailscale addresses and ports this server may connect out to, like backends on other nodes.
+    #[serde(default)]
+    pub tailnet_egress: Option<Vec<std::net::SocketAddrV4>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -151,6 +158,16 @@ pub struct ServerInfo {
     pub links: Vec<Uuid>,
     #[serde(default)]
     pub group: String,
+    #[serde(default)]
+    pub tailnet_allow: Vec<std::net::Ipv4Addr>,
+    #[serde(default)]
+    pub tailnet_egress: Vec<std::net::SocketAddrV4>,
+}
+
+/// Tailscale gives every device an address in 100.64.0.0/10.
+pub fn is_tailnet(ip: std::net::Ipv4Addr) -> bool {
+    let [a, b, ..] = ip.octets();
+    a == 100 && (64..128).contains(&b)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -253,6 +270,10 @@ pub struct NodeInfo {
     pub arch: String,
     pub cpu_count: u32,
     pub isolation: Vec<IsolationCheck>,
+    /// The internet's view of this machine, or empty if it couldn't be found. Behind a router,
+    /// or on a host that refuses incoming traffic, players may not reach it here.
+    #[serde(default)]
+    pub public_ip: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

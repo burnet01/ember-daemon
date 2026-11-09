@@ -55,6 +55,7 @@ Console output is sanitized so a server cannot send terminal control sequences t
 - **`/usr` is shared read-only.** A sandbox can read system libraries and anything else in `/usr`, so do not keep secrets there.
 - **Servers cannot reach each other unless linked.** A link lets one server open TCP connections to another server's game port on the same node, in one direction only, which is what a proxy needs to reach its backends. A compromised proxy can then attack the servers it's linked to, so link only what needs it. Servers on different nodes can't be linked.
 - **Private servers** have no public port at all, and only linked servers can reach them. A proxy's backends should be private, so players can't skip the proxy.
+- **Across nodes**, a private server can be opened on its node's Tailscale address to named Tailscale peers only, and a proxy's sandbox can be allowed to reach named Tailscale addresses and ports only. Nothing else in the tailnet becomes reachable. Backends with a public port instead rely on the forwarding secret to turn away anyone who skips the proxy.
 - **Game ports are public.** Anyone on the internet can connect to a port you open, so use a whitelist on private servers.
 - **Traffic between the panel and daemon** relies on Tailscale's WireGuard encryption rather than TLS.
 - **Servers stop when the daemon stops.** After an update, servers that were running come back. After any other restart or a reboot, only those with autostart do.

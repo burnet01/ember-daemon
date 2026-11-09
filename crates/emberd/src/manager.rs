@@ -67,6 +67,10 @@ pub struct ServerRecord {
     pub links: Vec<Uuid>,
     #[serde(default)]
     pub group: String,
+    #[serde(default)]
+    pub tailnet_allow: Vec<std::net::Ipv4Addr>,
+    #[serde(default)]
+    pub tailnet_egress: Vec<std::net::SocketAddrV4>,
 }
 
 pub struct Instance {
@@ -230,6 +234,8 @@ impl Instance {
             internal_address: format!("{}:{}", net::addrs(r.index).1, r.port),
             links: r.links,
             group: r.group,
+            tailnet_allow: r.tailnet_allow,
+            tailnet_egress: r.tailnet_egress,
         }
     }
 
@@ -309,6 +315,7 @@ pub struct Manager {
     servers: RwLock<HashMap<Uuid, Arc<Instance>>>,
     index_lock: Mutex<()>,
     cpu_prev: Mutex<Option<(u64, u64)>>,
+    pub public_ip: Mutex<String>,
     restart_tx: mpsc::UnboundedSender<Arc<Instance>>,
     restart_rx: Mutex<Option<mpsc::UnboundedReceiver<Arc<Instance>>>>,
     creating: Mutex<()>,
@@ -338,6 +345,7 @@ impl Manager {
             servers: RwLock::new(HashMap::new()),
             index_lock: Mutex::new(()),
             cpu_prev: Mutex::new(None),
+            public_ip: Mutex::new(String::new()),
         });
         std::fs::DirBuilder::new().recursive(true).mode(0o711).create(&mgr.cfg.data_dir)?;
         std::fs::DirBuilder::new().recursive(true).mode(0o700).create(mgr.servers_dir())?;
@@ -474,14 +482,8 @@ impl Manager {
         };
         validate_group(&req.group).map_err(bad_request)?;
         // A private server has no host port, so it can't clash with anything.
-        let port = if req.internal {
-            if self.port_reserved(req.port) {
-                return Err(bad_request(format!("port {} is reserved", req.port)));
-            }
-            req.port
-        } else {
-            self.pick_port(req.port, req.flavor.protocol())?
-        };
+        // Private servers get a free port too, so one can later be opened over Tailscale.
+        let port = self.pick_port(req.port, req.flavor.protocol())?;
 
         let index = self.allocate_index()?;
         let id = Uuid::new_v4();
@@ -508,6 +510,8 @@ impl Manager {
             internal: req.internal,
             links: Vec::new(),
             group: req.group.trim().to_string(),
+            tailnet_allow: Vec::new(),
+            tailnet_egress: Vec::new(),
         };
         let dir = self.server_dir(id);
         let path = dir.join("server.json");
@@ -793,7 +797,7 @@ impl Manager {
                 other.update(|r| r.links.retain(|l| *l != inst.id));
             }
         }
-        if let Err(e) = self.sync_links().await {
+        if let Err(e) = self.sync_paths().await {
             tracing::error!("could not update links: {e:#}");
         }
         let dir = self.server_dir(inst.id);
@@ -805,7 +809,7 @@ impl Manager {
     pub async fn update_settings(&self, inst: &Instance, req: UpdateServer) -> ApiResult<()> {
         // Saved first, with the create lock released, so nothing waits on the firewall while holding it.
         if self.apply_settings(inst, req)? {
-            self.sync_links().await?;
+            self.sync_paths().await?;
         }
         Ok(())
     }
@@ -824,7 +828,20 @@ impl Manager {
                 }
             }
         }
-        let relink = req.links.is_some();
+        for peer in req.tailnet_allow.iter().flatten() {
+            if !ember_proto::is_tailnet(*peer) {
+                return Err(bad_request(format!("{peer} isn't a Tailscale address")));
+            }
+        }
+        for dest in req.tailnet_egress.iter().flatten() {
+            if !ember_proto::is_tailnet(*dest.ip()) {
+                return Err(bad_request(format!("{dest} isn't a Tailscale address")));
+            }
+        }
+        if req.tailnet_allow.as_ref().is_some_and(|a| !a.is_empty()) && !inst.record().internal {
+            return Err(bad_request("only a private server can be opened over Tailscale"));
+        }
+        let relink = req.links.is_some() || req.tailnet_allow.is_some() || req.tailnet_egress.is_some();
         // Shared with create, so two changes at once can't both claim the same free memory.
         let _creating = self.creating.lock().expect("create lock");
         if let Some(n) = &req.name {
@@ -860,25 +877,58 @@ impl Manager {
             if let Some(group) = req.group {
                 r.group = group.trim().to_string();
             }
+            if let Some(mut allow) = req.tailnet_allow {
+                allow.sort();
+                allow.dedup();
+                r.tailnet_allow = allow;
+            }
+            if let Some(mut egress) = req.tailnet_egress {
+                egress.sort();
+                egress.dedup();
+                r.tailnet_egress = egress;
+            }
         });
         Ok(relink)
     }
 
-    /// Puts every server's links into the firewall. Addresses come from each server's slot,
-    /// so this works whether or not the servers are running.
-    pub async fn sync_links(&self) -> Result<()> {
+    /// Puts every server's links and Tailscale paths into the firewall. Addresses come from each
+    /// server's slot, so this works whether or not the servers are running.
+    /// Asks once at start how the internet sees this machine, for wiring servers across nodes.
+    pub fn find_public_ip(self: &Arc<Self>) {
+        let mgr = self.clone();
+        tokio::spawn(async move {
+            for _ in 0..5 {
+                let answer = async { mgr.http.get("https://checkip.amazonaws.com").send().await?.error_for_status()?.text().await }.await;
+                if let Ok(Ok(ip)) = answer.map(|t| t.trim().parse::<std::net::Ipv4Addr>()) {
+                    *mgr.public_ip.lock().expect("ip lock") = ip.to_string();
+                    return;
+                }
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+            tracing::warn!("couldn't find this machine's public address");
+        });
+    }
+
+    pub async fn sync_paths(&self) -> Result<()> {
         let all = self.all();
-        let mut links = Vec::new();
+        let mut paths = net::Paths::default();
         for s in &all {
-            let from = net::addrs(s.record().index).1;
-            for target in s.record().links {
-                if let Some(t) = all.iter().find(|t| t.id == target) {
-                    let r = t.record();
-                    links.push((from, net::addrs(r.index).1, r.port));
+            let r = s.record();
+            let me = net::addrs(r.index).1;
+            for target in &r.links {
+                if let Some(t) = all.iter().find(|t| t.id == *target) {
+                    let t = t.record();
+                    paths.links.push((me, net::addrs(t.index).1, t.port));
                 }
             }
+            for peer in &r.tailnet_allow {
+                paths.tailnet_in.push((*peer, r.port, me));
+            }
+            for dest in &r.tailnet_egress {
+                paths.egress.push((me, *dest.ip(), dest.port()));
+            }
         }
-        net::set_links(&links).await
+        net::set_paths(&paths).await
     }
 
     pub fn startup_info(&self, inst: &Instance) -> StartupInfo {
@@ -1683,6 +1733,8 @@ mod tests {
             internal: false,
             links: Vec::new(),
             group: String::new(),
+            tailnet_allow: Vec::new(),
+            tailnet_egress: Vec::new(),
         }
     }
 
@@ -1808,6 +1860,8 @@ mod tests {
             internal: false,
             links: Vec::new(),
             group: String::new(),
+            tailnet_allow: Vec::new(),
+            tailnet_egress: Vec::new(),
         };
         let dir = tempfile::tempdir().unwrap();
         let inst = Instance::new(rec, dir.path().join("s.json"), ServerState::Starting);

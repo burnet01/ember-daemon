@@ -38,7 +38,7 @@ pub async fn run(args: &[String]) -> Result<i32> {
     chown(&inside, Some(UID), Some(UID))?;
 
     cgroup::prepare_root()?;
-    net::init().await?;
+    net::init("tailscale0").await?;
     let key = "sandbox-test";
     let limits = Limits { memory_mb, cpu_percent: 200, disk_mb: 1024, pids };
     let cgroup_dir = cgroup::create(key, &limits)?;

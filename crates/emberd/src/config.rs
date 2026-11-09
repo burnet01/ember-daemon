@@ -22,6 +22,13 @@ pub struct Config {
     pub tmp_mb: u64,
     #[serde(default = "default_stop_timeout")]
     pub stop_timeout_secs: u64,
+    /// Where Tailscale traffic arrives. Only tests change it.
+    #[serde(default = "default_tailnet_interface")]
+    pub tailnet_interface: String,
+}
+
+fn default_tailnet_interface() -> String {
+    "tailscale0".into()
 }
 
 fn default_port() -> u16 {
@@ -62,6 +69,11 @@ impl Config {
         // Every tagged device shares this pseudo-login, so it can never identify a person.
         if self.owners.iter().any(|o| o.trim().is_empty() || o.eq_ignore_ascii_case("tagged-devices")) {
             bail!("`owners` contains an entry that cannot identify a person");
+        }
+        // It goes into firewall rules as written.
+        let iface = &self.tailnet_interface;
+        if iface.is_empty() || iface.len() > 15 || !iface.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c)) {
+            bail!("`tailnet_interface` must be a network interface name");
         }
         if !self.data_dir.is_absolute() {
             bail!("`data_dir` must be an absolute path");

@@ -137,6 +137,7 @@ async fn node_info(State(app): State<AppState>, Extension(Login(login)): Extensi
         arch: std::env::consts::ARCH.into(),
         cpu_count: node::cpu_count(),
         isolation: node::isolation_checks(),
+        public_ip: app.mgr.public_ip.lock().expect("ip lock").clone(),
     })
 }
 

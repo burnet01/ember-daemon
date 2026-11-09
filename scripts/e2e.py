@@ -425,6 +425,80 @@ def test_links(sid, data):
     api("PATCH", f"/v1/servers/{sid}", {"links": [bid]})
     check("the private server is removed", api("DELETE", f"/v1/servers/{bid}", timeout=120)[0] == 204)
     check("deleting it removes the link", api("GET", f"/v1/servers/{sid}")[1]["links"] == [])
+    test_tailnet(sid, data)
+
+
+TS_IFACE = "e2ets0"
+TS_NS = "e2e-tailnet"
+TS_HOST, TS_PEER, TS_STRANGER = "100.100.5.1", "100.100.5.2", "100.100.5.3"
+
+
+def setup_ts_ns():
+    """A fake tailnet: the host end is the interface the daemon treats as Tailscale."""
+    subprocess.run(["ip", "netns", "del", TS_NS], capture_output=True)
+    subprocess.run(["ip", "link", "del", TS_IFACE], capture_output=True)
+    sh("ip", "netns", "add", TS_NS)
+    sh("ip", "link", "add", TS_IFACE, "type", "veth", "peer", "name", "e2etsp")
+    sh("ip", "link", "set", "e2etsp", "netns", TS_NS)
+    sh("ip", "addr", "add", f"{TS_HOST}/24", "dev", TS_IFACE)
+    sh("ip", "link", "set", TS_IFACE, "up")
+    sh("ip", "-n", TS_NS, "addr", "add", f"{TS_PEER}/24", "dev", "e2etsp")
+    sh("ip", "-n", TS_NS, "addr", "add", f"{TS_STRANGER}/24", "dev", "e2etsp")
+    sh("ip", "-n", TS_NS, "link", "set", "e2etsp", "up")
+    sh("ip", "-n", TS_NS, "link", "set", "lo", "up")
+
+
+def ts_connect(source, port):
+    snippet = "import socket,sys; s=socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=5, source_address=(sys.argv[3], 0)); s.close()"
+    r = subprocess.run(["ip", "netns", "exec", TS_NS, sys.executable, "-c", snippet, TS_HOST, str(port), source], capture_output=True, timeout=30)
+    return r.returncode == 0
+
+
+def test_tailnet(sid, data):
+    print("=== private servers over Tailscale", flush=True)
+    req = {"name": "E2E ts backend", "flavor": "custom", "version": "vanilla", "limits": LIMITS, "port": 25620, "eula_accepted": True, "internal": True}
+    code, b = api("POST", "/v1/servers", req)
+    check("a private server is created for Tailscale", code == 201, str(b))
+    if code != 201:
+        return
+    bid = b["id"]
+    wait_state(bid, ("offline", "install_failed"), 300)
+    base = f"/v1/servers/{bid}/files"
+    api("PUT", f"{base}/upload?path=server.jar", raw=(data / "server.jar").read_bytes(), timeout=120)
+    api("PUT", f"{base}/content", {"path": "eula.txt", "content": "eula=true\n"})
+    port = b["port"]
+    props = (data / "server.properties").read_text().replace("server-port=25565", f"server-port={port}")
+    api("PUT", f"{base}/content", {"path": "server.properties", "content": props})
+    api("POST", f"/v1/servers/{bid}/power", {"action": "start"})
+    state, _ = wait_state(bid, ("running",), 300)
+    check("it runs", state == "running", str(state))
+
+    check("a peer can't reach it before it's allowed", not ts_connect(TS_PEER, port))
+    check("a public server can't be opened over Tailscale", api("PATCH", f"/v1/servers/{sid}", {"tailnet_allow": [TS_PEER]})[0] == 400)
+    check("a non-Tailscale address is refused", api("PATCH", f"/v1/servers/{bid}", {"tailnet_allow": ["8.8.8.8"]})[0] == 400)
+    check("a Tailscale peer is allowed", api("PATCH", f"/v1/servers/{bid}", {"tailnet_allow": [TS_PEER]})[0] == 200)
+    check("the allowed peer reaches it over Tailscale", ts_connect(TS_PEER, port))
+    check("another Tailscale device still can't", not ts_connect(TS_STRANGER, port))
+    check("it still has no public port", not ext_ping(port)[0])
+    api("PATCH", f"/v1/servers/{bid}", {"tailnet_allow": []})
+    check("removing the peer closes it", not ts_connect(TS_PEER, port))
+
+    # Out the other way: a proxy reaching a backend on another node.
+    listener = subprocess.Popen(["ip", "netns", "exec", TS_NS, sys.executable, "-c",
+        "import socket; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(('0.0.0.0', 25700)); s.listen(); [s.accept()[0].close() for _ in iter(int, 1)]"])
+    time.sleep(1)
+    a_ns = netns_with(api("GET", f"/v1/servers/{sid}")[1]["internal_address"])
+    dial = lambda port: subprocess.run(["ip", "netns", "exec", a_ns, sys.executable, "-c",
+        f"import socket; socket.create_connection(('{TS_PEER}', {port}), timeout=5).close()"], capture_output=True, timeout=30).returncode == 0
+    check("a server can't reach the tailnet by default", not dial(25700))
+    check("a non-Tailscale egress address is refused", api("PATCH", f"/v1/servers/{sid}", {"tailnet_egress": ["8.8.8.8:53"]})[0] == 400)
+    check("egress to one Tailscale address and port is allowed", api("PATCH", f"/v1/servers/{sid}", {"tailnet_egress": [f"{TS_PEER}:25700"]})[0] == 200)
+    check("the server reaches it", dial(25700))
+    check("but no other port on it", not dial(25701))
+    api("PATCH", f"/v1/servers/{sid}", {"tailnet_egress": []})
+    check("removing egress closes it", not dial(25700))
+    listener.kill()
+    check("the Tailscale test server is removed", api("DELETE", f"/v1/servers/{bid}", timeout=120)[0] == 204)
 
 
 def test_files(sid, data, uid):
@@ -898,9 +972,10 @@ def main():
     data_root = os.path.join(work, "data")
     config = os.path.join(work, "config.toml")
     with open(config, "w") as f:
-        f.write(f'owners = ["{OWNER}"]\nport = {API_PORT}\ndata_dir = "{data_root}"\ntailscale_socket = "{sock_path}"\nstop_timeout_secs = 45\n')
+        f.write(f'owners = ["{OWNER}"]\nport = {API_PORT}\ndata_dir = "{data_root}"\ntailscale_socket = "{sock_path}"\nstop_timeout_secs = 45\ntailnet_interface = "{TS_IFACE}"\n')
 
     setup_ext_ns()
+    setup_ts_ns()
     log_path = os.path.join(work, "emberd.log")
     log = open(log_path, "w")
     def start_daemon():
@@ -933,6 +1008,8 @@ def main():
         print("--- emberd log (tail) ---")
         print(pathlib.Path(log_path).read_text()[-6000:])
         subprocess.run(["ip", "netns", "del", EXT_NS], capture_output=True)
+        subprocess.run(["ip", "netns", "del", TS_NS], capture_output=True)
+        subprocess.run(["ip", "link", "del", TS_IFACE], capture_output=True)
         subprocess.run(["ip", "link", "del", "e2eh"], capture_output=True)
         server.shutdown()
         shutil.rmtree(work, ignore_errors=True)
