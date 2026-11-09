@@ -686,6 +686,9 @@ impl Manager {
         let readers = start_pumps(&mut child, inst, true);
         let (mgr, inst2) = (self.clone(), inst.clone());
         tokio::spawn(async move { mgr.monitor(inst2, child, readers).await });
+        if rec.flavor == Flavor::Custom {
+            tokio::spawn(watch_port(inst.clone(), net::addrs(rec.index).1, rec.port));
+        }
         Ok(())
     }
 
@@ -1595,6 +1598,23 @@ fn emit(inst: &Instance, raw: &[u8], detect_ready: bool) {
     inst.log(text);
     if detect_ready && inst.state() == ServerState::Starting && is_ready_line(text) {
         inst.set_state(ServerState::Running);
+    }
+}
+
+/// Custom software prints whatever it likes, so it counts as running once its game port
+/// takes connections.
+async fn watch_port(inst: Arc<Instance>, ip: std::net::Ipv4Addr, port: u16) {
+    let started = Instant::now();
+    while inst.state() == ServerState::Starting && started.elapsed() < Duration::from_secs(600) {
+        let attempt = tokio::time::timeout(Duration::from_secs(1), tokio::net::TcpStream::connect((ip, port))).await;
+        if matches!(attempt, Ok(Ok(_))) {
+            if inst.state() == ServerState::Starting {
+                inst.set_state(ServerState::Running);
+                inst.log(&format!("[ember] Port {port} is open, so the server is running"));
+            }
+            return;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
 

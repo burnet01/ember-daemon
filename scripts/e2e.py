@@ -403,7 +403,7 @@ def test_links(sid, data):
     api("PUT", f"{base}/content", {"path": "server.properties", "content": props})
     check("with its jar it starts", api("POST", f"/v1/servers/{bid}/power", {"action": "start"})[0] == 202)
     state, _ = wait_state(bid, ("running",), 300)
-    check("the custom server runs", state == "running", str(state))
+    check("the custom server runs, and shows Running once its port opens", state == "running", str(state))
     if state != "running":
         api("DELETE", f"/v1/servers/{bid}", timeout=120)
         return
