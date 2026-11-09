@@ -36,6 +36,7 @@ delete table inet ember
 table inet ember {{
   map tcp_ports {{ type inet_service : ipv4_addr; }}
   map udp_ports {{ type inet_service : ipv4_addr; }}
+  set links {{ type ipv4_addr . ipv4_addr . inet_service; }}
 
   chain prerouting {{
     type nat hook prerouting priority -100; policy accept;
@@ -59,6 +60,8 @@ table inet ember {{
   }}
   chain forward {{
     type filter hook forward priority -10; policy accept;
+    iifname "embh*" oifname "embh*" ct state established,related accept
+    iifname "embh*" oifname "embh*" ip saddr . ip daddr . tcp dport @links accept
     oifname "embh*" iifname "embh*" counter drop
     oifname "embh*" ct state established,related accept
     oifname "embh*" ct status dnat accept
@@ -160,12 +163,22 @@ pub async fn offline_down(index: u32) {
     let _ = run("ip", &["netns", "del", &offline_name(index)]).await;
 }
 
-/// Creates the namespace, wires it to the host and opens the game port.
-pub async fn up(index: u32, port: u16, proto: Protocol) -> Result<String> {
+/// Replaces the allowed server-to-server connections: (from, to, port on `to`).
+pub async fn set_links(links: &[(Ipv4Addr, Ipv4Addr, u16)]) -> Result<()> {
+    let mut script = String::from("flush set inet ember links\n");
+    if !links.is_empty() {
+        let items: Vec<String> = links.iter().map(|(a, b, p)| format!("{a} . {b} . {p}")).collect();
+        script.push_str(&format!("add element inet ember links {{ {} }}\n", items.join(", ")));
+    }
+    nft(&script).await
+}
+
+/// Creates the namespace, wires it to the host and opens the game port unless it's private.
+pub async fn up(index: u32, port: u16, proto: Protocol, public: bool) -> Result<String> {
     if index == 0 || index > MAX_INDEX {
         bail!("network index {index} out of range");
     }
-    let result = setup(index, port, proto).await;
+    let result = setup(index, port, proto, public).await;
     if let Err(e) = result {
         down(index, port, proto).await;
         return Err(e);
@@ -173,7 +186,7 @@ pub async fn up(index: u32, port: u16, proto: Protocol) -> Result<String> {
     Ok(netns_name(index))
 }
 
-async fn setup(index: u32, port: u16, proto: Protocol) -> Result<()> {
+async fn setup(index: u32, port: u16, proto: Protocol, public: bool) -> Result<()> {
     let ns = netns_name(index);
     let (host, peer) = (format!("embh{index}"), format!("embp{index}"));
     let (host_ip, sandbox_ip) = addrs(index);
@@ -195,7 +208,9 @@ async fn setup(index: u32, port: u16, proto: Protocol) -> Result<()> {
     run("ip", &["-n", &ns, "link", "set", "eth0", "up"]).await?;
     run("ip", &["-n", &ns, "route", "add", "default", "via", &gateway]).await?;
     run("ip", &["netns", "exec", &ns, "sysctl", "-qw", "net.ipv6.conf.all.disable_ipv6=1"]).await?;
-
+    if !public {
+        return Ok(());
+    }
     nft(&format!("add element inet ember {} {{ {port} : {sandbox_ip} }}\n", map_name(proto))).await
 }
 

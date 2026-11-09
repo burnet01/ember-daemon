@@ -42,7 +42,7 @@ pub async fn run(args: &[String]) -> Result<i32> {
     let key = "sandbox-test";
     let limits = Limits { memory_mb, cpu_percent: 200, disk_mb: 1024, pids };
     let cgroup_dir = cgroup::create(key, &limits)?;
-    let netns = net::up(INDEX, PORT, Protocol::Tcp).await?;
+    let netns = net::up(INDEX, PORT, Protocol::Tcp, true).await?;
 
     let cfg = crate::config::Config::parse(r#"owners = ["sandbox-test"]"#)?;
     let mut argv = vec![format!("{}/probe", crate::sandbox::HOME)];

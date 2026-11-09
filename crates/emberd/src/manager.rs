@@ -61,6 +61,12 @@ pub struct ServerRecord {
     pub last_error: Option<String>,
     #[serde(default)]
     pub schedules: Vec<Schedule>,
+    #[serde(default)]
+    pub internal: bool,
+    #[serde(default)]
+    pub links: Vec<Uuid>,
+    #[serde(default)]
+    pub group: String,
 }
 
 pub struct Instance {
@@ -220,6 +226,10 @@ impl Instance {
             java_major: r.java_major,
             created_at: r.created_at,
             last_error: r.last_error,
+            internal: r.internal,
+            internal_address: format!("{}:{}", net::addrs(r.index).1, r.port),
+            links: r.links,
+            group: r.group,
         }
     }
 
@@ -462,7 +472,16 @@ impl Manager {
             install::validate_version(&req.version).map_err(|e| bad_request(e.to_string()))?;
             req.version.clone()
         };
-        let port = self.pick_port(req.port, req.flavor.protocol())?;
+        validate_group(&req.group).map_err(bad_request)?;
+        // A private server has no host port, so it can't clash with anything.
+        let port = if req.internal {
+            if self.port_reserved(req.port) {
+                return Err(bad_request(format!("port {} is reserved", req.port)));
+            }
+            req.port
+        } else {
+            self.pick_port(req.port, req.flavor.protocol())?
+        };
 
         let index = self.allocate_index()?;
         let id = Uuid::new_v4();
@@ -478,7 +497,7 @@ impl Manager {
             autostart: false,
             restart_on_crash: false,
             startup: StartupOptions {
-                server_args: if req.flavor == Flavor::Bedrock { vec![] } else { vec!["nogui".to_string()] },
+                server_args: if matches!(req.flavor, Flavor::Bedrock | Flavor::Custom) { vec![] } else { vec!["nogui".to_string()] },
                 ..Default::default()
             },
             java_major: None,
@@ -486,6 +505,9 @@ impl Manager {
             start: None,
             last_error: None,
             schedules: Vec::new(),
+            internal: req.internal,
+            links: Vec::new(),
+            group: req.group.trim().to_string(),
         };
         let dir = self.server_dir(id);
         let path = dir.join("server.json");
@@ -562,7 +584,7 @@ impl Manager {
         })
         .await??;
         let proto = rec.flavor.protocol();
-        let netns = match net::up(rec.index, rec.port, proto).await {
+        let netns = match net::up(rec.index, rec.port, proto, !rec.internal).await {
             Ok(ns) => ns,
             Err(e) => {
                 cgroup::kill_and_remove(&key);
@@ -631,8 +653,14 @@ impl Manager {
         let data = self.data_dir(inst.id);
         let owner = inst.owner();
         let port = rec.port;
+        let custom = rec.flavor == Flavor::Custom;
         tokio::task::spawn_blocking(move || -> Result<()> {
             let root = files::open_root(&data)?;
+            // Custom software has its own config, which the panel writes.
+            if custom {
+                files::open_regular(&root, Path::new("server.jar")).context("upload a server.jar first")?;
+                return Ok(());
+            }
             files::enforce_property(&root, "server-port", &port.to_string(), owner)?;
             files::enforce_property(&root, "server-ip", "", owner)
         })
@@ -756,6 +784,15 @@ impl Manager {
         }
         self.stop_locked(&inst).await?;
         self.servers.write().expect("servers lock").remove(&inst.id);
+        // Nothing may keep a link to a slot that a future server could reuse.
+        for other in self.all() {
+            if other.record().links.contains(&inst.id) {
+                other.update(|r| r.links.retain(|l| *l != inst.id));
+            }
+        }
+        if let Err(e) = self.sync_links().await {
+            tracing::error!("could not update links: {e:#}");
+        }
         let dir = self.server_dir(inst.id);
         // std's remove_dir_all does not follow symlinks.
         tokio::task::spawn_blocking(move || std::fs::remove_dir_all(dir)).await.map_err(anyhow::Error::from)?.map_err(anyhow::Error::from)?;
@@ -763,6 +800,28 @@ impl Manager {
     }
 
     pub async fn update_settings(&self, inst: &Instance, req: UpdateServer) -> ApiResult<()> {
+        // Saved first, with the create lock released, so nothing waits on the firewall while holding it.
+        if self.apply_settings(inst, req)? {
+            self.sync_links().await?;
+        }
+        Ok(())
+    }
+
+    fn apply_settings(&self, inst: &Instance, req: UpdateServer) -> ApiResult<bool> {
+        if let Some(group) = &req.group {
+            validate_group(group).map_err(bad_request)?;
+        }
+        if let Some(links) = &req.links {
+            for target in links {
+                if *target == inst.id {
+                    return Err(bad_request("a server can't link to itself"));
+                }
+                if self.get(*target).is_err() {
+                    return Err(bad_request(format!("there's no server {target} on this node")));
+                }
+            }
+        }
+        let relink = req.links.is_some();
         // Shared with create, so two changes at once can't both claim the same free memory.
         let _creating = self.creating.lock().expect("create lock");
         if let Some(n) = &req.name {
@@ -790,8 +849,33 @@ impl Manager {
             if let Some(c) = req.restart_on_crash {
                 r.restart_on_crash = c;
             }
+            if let Some(mut links) = req.links {
+                links.sort();
+                links.dedup();
+                r.links = links;
+            }
+            if let Some(group) = req.group {
+                r.group = group.trim().to_string();
+            }
         });
-        Ok(())
+        Ok(relink)
+    }
+
+    /// Puts every server's links into the firewall. Addresses come from each server's slot,
+    /// so this works whether or not the servers are running.
+    pub async fn sync_links(&self) -> Result<()> {
+        let all = self.all();
+        let mut links = Vec::new();
+        for s in &all {
+            let from = net::addrs(s.record().index).1;
+            for target in s.record().links {
+                if let Some(t) = all.iter().find(|t| t.id == target) {
+                    let r = t.record();
+                    links.push((from, net::addrs(r.index).1, r.port));
+                }
+            }
+        }
+        net::set_links(&links).await
     }
 
     pub fn startup_info(&self, inst: &Instance) -> StartupInfo {
@@ -1203,6 +1287,14 @@ impl Manager {
     }
 }
 
+pub fn validate_group(group: &str) -> Result<(), String> {
+    let g = group.trim();
+    if g.len() > 40 || !g.chars().all(|c| c.is_ascii_alphanumeric() || " -_.".contains(c)) {
+        return Err("a group name can use letters, numbers, spaces, dashes and dots, up to 40".into());
+    }
+    Ok(())
+}
+
 pub fn validate_cron(expr: &str) -> Result<(), String> {
     use std::str::FromStr;
     cron::Schedule::from_str(expr).map(|_| ()).map_err(|e| format!("invalid schedule: {e}"))
@@ -1568,6 +1660,9 @@ mod tests {
             start: Some(StartSpec::Jar { path: "server.jar".into() }),
             last_error: None,
             schedules: vec![],
+            internal: false,
+            links: Vec::new(),
+            group: String::new(),
         }
     }
 
@@ -1690,6 +1785,9 @@ mod tests {
             start: None,
             last_error: None,
             schedules: vec![],
+            internal: false,
+            links: Vec::new(),
+            group: String::new(),
         };
         let dir = tempfile::tempdir().unwrap();
         let inst = Instance::new(rec, dir.path().join("s.json"), ServerState::Starting);

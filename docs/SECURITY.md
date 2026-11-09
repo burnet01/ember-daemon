@@ -53,7 +53,8 @@ Console output is sanitized so a server cannot send terminal control sequences t
 - **Shared kernel.** Like Docker, this is not a virtual machine. A kernel exploit that survives the seccomp filter could escape. For strangers' code, use a VM per tenant.
 - **Disk limits are not instant.** Usage is scanned every 30 seconds, then the server is stopped. A fast writer can pass its limit between scans, and a single file is capped at the disk limit. Use a dedicated partition for `/var/lib/ember` if a full disk would hurt other services.
 - **`/usr` is shared read-only.** A sandbox can read system libraries and anything else in `/usr`, so do not keep secrets there.
-- **Servers cannot reach each other.** This is deliberate, but proxy setups such as Velocity need it, and it is not supported yet.
+- **Servers cannot reach each other unless linked.** A link lets one server open TCP connections to another server's game port on the same node, in one direction only, which is what a proxy needs to reach its backends. A compromised proxy can then attack the servers it's linked to, so link only what needs it. Servers on different nodes can't be linked.
+- **Private servers** have no public port at all, and only linked servers can reach them. A proxy's backends should be private, so players can't skip the proxy.
 - **Game ports are public.** Anyone on the internet can connect to a port you open, so use a whitelist on private servers.
 - **Traffic between the panel and daemon** relies on Tailscale's WireGuard encryption rather than TLS.
 - **Servers stop when the daemon stops.** After an update, servers that were running come back. After any other restart or a reboot, only those with autostart do.

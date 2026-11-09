@@ -355,6 +355,7 @@ def test_full_server(version, data_root):
     limit = pathlib.Path(f"/sys/fs/cgroup/ember/{sid}/memory.max").read_text().strip()
     check("memory cgroup is enforced", limit == str(2048 << 20), limit)
 
+    test_links(sid, data)
     test_files(sid, data, expected_uid)
     test_backups_and_power(sid, data)
 
@@ -362,6 +363,68 @@ def test_full_server(version, data_root):
 def ws_console_dump(data_root, sid):
     log = pathlib.Path(data_root) / "servers" / sid / "data" / "logs" / "latest.log"
     return log.read_text()[-3000:] if log.exists() else "(no log)"
+
+
+def netns_with(address):
+    ip = address.split(":")[0]
+    for line in subprocess.run(["ip", "netns", "list"], capture_output=True, text=True).stdout.splitlines():
+        ns = line.split()[0]
+        if ns.startswith("ember-") and ns != EXT_NS:
+            if f"inet {ip}/" in subprocess.run(["ip", "-n", ns, "-4", "addr"], capture_output=True, text=True).stdout:
+                return ns
+    return None
+
+
+def ping_from(ns, address):
+    host, port = address.split(":")
+    r = subprocess.run(["ip", "netns", "exec", ns, sys.executable, "-c", PING_SNIPPET, host, port], capture_output=True, text=True, timeout=30)
+    return r.returncode == 0
+
+
+def test_links(sid, data):
+    print("=== custom jars, private servers and links", flush=True)
+    req = {"name": "E2E backend", "flavor": "custom", "version": "vanilla", "limits": LIMITS, "port": 25610,
+           "eula_accepted": True, "internal": True, "group": "e2e group"}
+    code, b = api("POST", "/v1/servers", req)
+    check("a private custom server is created", code == 201 and b["internal"] and b["group"] == "e2e group", str(b))
+    if code != 201:
+        return
+    bid = b["id"]
+    state, info = wait_state(bid, ("offline", "install_failed"), 300)
+    check("a custom server only installs Java", state == "offline" and info["java_major"] == 25, f"{state} {info and info.get('last_error')}")
+    code, body = api("POST", f"/v1/servers/{bid}/power", {"action": "start"})
+    check("it won't start without a jar", code >= 400 and "server.jar" in str(body), f"{code} {body}")
+    check("bad group names are refused", api("POST", "/v1/servers", {**req, "group": "x;rm -rf"})[0] == 400)
+
+    base = f"/v1/servers/{bid}/files"
+    api("PUT", f"{base}/upload?path=server.jar", raw=(data / "server.jar").read_bytes(), timeout=120)
+    api("PUT", f"{base}/content", {"path": "eula.txt", "content": "eula=true\n"})
+    props = (data / "server.properties").read_text().replace("server-port=25565", "server-port=25610")
+    api("PUT", f"{base}/content", {"path": "server.properties", "content": props})
+    check("with its jar it starts", api("POST", f"/v1/servers/{bid}/power", {"action": "start"})[0] == 202)
+    state, _ = wait_state(bid, ("running",), 300)
+    check("the custom server runs", state == "running", str(state))
+    if state != "running":
+        api("DELETE", f"/v1/servers/{bid}", timeout=120)
+        return
+
+    a = api("GET", f"/v1/servers/{sid}")[1]
+    b = api("GET", f"/v1/servers/{bid}")[1]
+    a_ns, b_ns = netns_with(a["internal_address"]), netns_with(b["internal_address"])
+    check("both servers' networks are found", bool(a_ns and b_ns), f"{a_ns} {b_ns}")
+    check("a private server isn't reachable from the internet", not ext_ping(25610)[0])
+    check("servers can't reach each other unlinked", not ping_from(a_ns, b["internal_address"]))
+    check("linking to itself is refused", api("PATCH", f"/v1/servers/{sid}", {"links": [sid]})[0] == 400)
+    check("linking to nothing is refused", api("PATCH", f"/v1/servers/{sid}", {"links": ["00000000-0000-0000-0000-000000000000"]})[0] == 400)
+    check("a link is accepted", api("PATCH", f"/v1/servers/{sid}", {"links": [bid]})[0] == 200)
+    check("a linked server reaches the private one", ping_from(a_ns, b["internal_address"]))
+    check("links only go one way", not ping_from(b_ns, a["internal_address"]))
+    check("the link doesn't open other ports", not ping_from(a_ns, b["internal_address"].split(":")[0] + ":22"))
+    api("PATCH", f"/v1/servers/{sid}", {"links": []})
+    check("unlinking closes it again", not ping_from(a_ns, b["internal_address"]))
+    api("PATCH", f"/v1/servers/{sid}", {"links": [bid]})
+    check("the private server is removed", api("DELETE", f"/v1/servers/{bid}", timeout=120)[0] == 204)
+    check("deleting it removes the link", api("GET", f"/v1/servers/{sid}")[1]["links"] == [])
 
 
 def test_files(sid, data, uid):

@@ -18,6 +18,8 @@ pub enum Flavor {
     Fabric,
     Forge,
     Bedrock,
+    /// Your own jar, uploaded by the panel. Only Java is installed.
+    Custom,
 }
 
 impl Flavor {
@@ -102,6 +104,12 @@ pub struct CreateServer {
     /// Lets the memory assigned across this node's servers go past what the machine has.
     #[serde(default)]
     pub allow_overallocate: bool,
+    /// No public port: only servers linked to it on the same node can reach it.
+    #[serde(default)]
+    pub internal: bool,
+    /// Servers deployed together share a group name, like "primetiers".
+    #[serde(default)]
+    pub group: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -112,6 +120,11 @@ pub struct UpdateServer {
     pub restart_on_crash: Option<bool>,
     #[serde(default)]
     pub allow_overallocate: bool,
+    /// Servers on this node this one may connect to, like a proxy's backends.
+    #[serde(default)]
+    pub links: Option<Vec<Uuid>>,
+    #[serde(default)]
+    pub group: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,6 +142,15 @@ pub struct ServerInfo {
     pub java_major: Option<u32>,
     pub created_at: u64,
     pub last_error: Option<String>,
+    #[serde(default)]
+    pub internal: bool,
+    /// Where linked servers on the same node reach it, like 10.213.0.6:25565.
+    #[serde(default)]
+    pub internal_address: String,
+    #[serde(default)]
+    pub links: Vec<Uuid>,
+    #[serde(default)]
+    pub group: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

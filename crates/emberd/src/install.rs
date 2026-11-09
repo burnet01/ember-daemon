@@ -30,6 +30,9 @@ pub enum Verify {
     Tls,
 }
 
+/// What custom jars run on unless the Startup page picks another version.
+pub const CUSTOM_JAVA: u32 = 25;
+
 pub fn validate_version(v: &str) -> Result<()> {
     let ok = !v.is_empty() && v.len() <= 64 && v.bytes().all(|b| b.is_ascii_alphanumeric() || b"._+-".contains(&b));
     if !ok {
@@ -117,7 +120,7 @@ async fn mojang_version(http: &reqwest::Client, id: &str) -> Result<MojangVersio
 
 pub async fn list_versions(http: &reqwest::Client, flavor: Flavor) -> Result<Vec<GameVersion>> {
     match flavor {
-        Flavor::Bedrock => Ok(vec![]),
+        Flavor::Bedrock | Flavor::Custom => Ok(vec![]),
         Flavor::Vanilla => {
             let m: Manifest = get_json(http, MOJANG_MANIFEST).await?;
             Ok(m.versions
@@ -384,6 +387,17 @@ pub async fn run(mgr: &Arc<Manager>, inst: &Arc<Instance>) -> Result<()> {
         return Ok(());
     }
 
+    if flavor == Flavor::Custom {
+        let major = inst.record().startup.java_major.unwrap_or(CUSTOM_JAVA);
+        ensure_java(mgr, major).await?;
+        inst.update(|r| {
+            r.java_major = Some(major);
+            r.start = Some(StartSpec::Jar { path: "server.jar".into() });
+        });
+        inst.log(&format!("[ember] Java {major} is ready. Upload server.jar, then start the server."));
+        return Ok(());
+    }
+
     validate_version(&version)?;
     let mojang = mojang_version(http, &version).await?;
     let major = runtime_major(mojang.java_major);
@@ -441,7 +455,7 @@ pub async fn run(mgr: &Arc<Manager>, inst: &Arc<Instance>) -> Result<()> {
             .await??;
             spec
         }
-        Flavor::Bedrock => unreachable!("handled above"),
+        Flavor::Bedrock | Flavor::Custom => unreachable!("handled above"),
     };
 
     let d = data.clone();

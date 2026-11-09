@@ -131,6 +131,7 @@ async fn serve(config: std::path::PathBuf) -> anyhow::Result<()> {
     sandbox::net::init().await?;
 
     let mgr = manager::Manager::load(cfg)?;
+    mgr.sync_links().await.context("restore server links")?;
     mgr.spawn_background();
 
     {
