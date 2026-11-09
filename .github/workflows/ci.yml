@@ -144,7 +144,7 @@ jobs:
       - name: Install emberd
         env:
           EMBER_OWNER: ${{ secrets.EMBER_OWNER }}
-        run: sudo bash packaging/install.sh ./target/debug/emberd "$EMBER_OWNER"
+        run: sudo bash packaging/install.sh --binary ./target/debug/emberd --owner "$EMBER_OWNER"
       - name: Stay up for the test window
         run: |
           echo "Test node is up as ember-ci-$GITHUB_RUN_ID for $TEST_MINUTES minutes."

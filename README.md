@@ -10,21 +10,19 @@ Minecraft is supported: Paper, Vanilla, Fabric, Forge and Bedrock.
 
 ## Install a node
 
-Requires Linux with cgroup v2, `nftables`, `iproute2` and Tailscale logged in.
+The steps are also at <https://burnet01.github.io/TESTME/>. On x86_64 Linux with systemd and cgroup v2, run:
 
-1. Download `emberd-linux-x86_64` from a successful `release` CI run.
-2. Run:
+```sh
+curl -fsSL https://burnet01.github.io/TESTME/install.sh | sudo bash
+```
 
-   ```sh
-   sudo bash packaging/install.sh ./target/release/emberd you@example.com
-   ```
+It installs `nftables`, `iproute2` and Tailscale if they're missing, shows a login link if the machine isn't on Tailscale, and makes that machine's Tailscale login the owner. To set a different owner, add `-s -- --owner you@example.com` after `bash`.
 
-   The second argument is your Tailscale login. Find it with `tailscale status --json | grep LoginName`.
-3. Check the node with `sudo emberd doctor`.
+Run the same command to update. Check a node with `sudo emberd doctor`.
 
 ## Run the panel
 
-Download `ember-panel-windows` from a `panel` CI run, or run `cargo run --release -p ember-panel`, on a machine logged in to Tailscale as that same account. Nodes appear automatically.
+Download [`ember-panel.exe`](https://github.com/burnet01/TESTME/releases/latest/download/ember-panel.exe), or run `cargo run --release -p ember-panel`, on a machine logged in to Tailscale as that same account. Nodes appear automatically.
 
 `ember-panel --demo` shows the interface with sample data and makes no network connections.
 
@@ -38,7 +36,7 @@ See [docs/SECURITY.md](docs/SECURITY.md) for what is protected, how, and the kno
 
 ## Testing
 
-GitHub Actions never runs automatically, to keep usage low. Start one suite at a time, for example `gh workflow run CI -f suite=sandbox`:
+The test suites never run automatically, to keep GitHub Actions usage low. Start one at a time, for example `gh workflow run CI -f suite=sandbox`:
 
 | Suite | What it proves |
 | --- | --- |
@@ -51,6 +49,10 @@ GitHub Actions never runs automatically, to keep usage low. Start one suite at a
 | `tailnet-test` | Runs a temporary node on your tailnet for 20 minutes to try the panel, then leaves. Needs the `TS_AUTHKEY` (ephemeral) and `EMBER_OWNER` secrets. Not for hosting |
 
 CI runners are not on a tailnet, so the end-to-end test replaces tailscaled with a fake one speaking the same local API. Everything else in that path is real.
+
+## Publishing
+
+Pushing a version tag such as `v0.2.0` runs the `Publish` workflow, which tests and builds both programs and creates a release. The install command and download link always use the latest release. The `Website` workflow updates the site in a few seconds when `site/` or `packaging/install.sh` changes.
 
 ## Development
 

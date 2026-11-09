@@ -1,0 +1,78 @@
+name: Publish
+
+# Builds the daemon and panel and publishes them as a release. Runs only when a
+# version tag is pushed or by hand, never on ordinary commits.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to publish, like v0.2.0
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  daemon:
+    name: Linux daemon
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
+      - run: rustup toolchain install stable --profile minimal -t x86_64-unknown-linux-musl && rustup default stable
+      - run: cargo test -p ember-proto -p emberd
+      # Static, so one file runs on any distro whatever its system libraries.
+      - run: cargo build --release -p emberd --target x86_64-unknown-linux-musl
+      - run: cp target/x86_64-unknown-linux-musl/release/emberd emberd-linux-x86_64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: daemon
+          path: emberd-linux-x86_64
+          retention-days: 1
+
+  panel:
+    name: Windows panel
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal; rustup default stable
+      - run: cargo test -p ember-panel
+      - run: cargo build --release -p ember-panel
+      - uses: actions/upload-artifact@v4
+        with:
+          name: panel
+          path: target/release/ember-panel.exe
+          retention-days: 1
+
+  release:
+    name: Publish the release
+    needs: [daemon, panel]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.version || github.ref_name }}
+        run: |
+          sha256sum emberd-linux-x86_64 > emberd-linux-x86_64.sha256
+          sha256sum ember-panel.exe > ember-panel.exe.sha256
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "Ember $TAG" --generate-notes --latest \
+            emberd-linux-x86_64 emberd-linux-x86_64.sha256 ember-panel.exe ember-panel.exe.sha256

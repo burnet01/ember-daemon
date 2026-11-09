@@ -1,0 +1,38 @@
+name: Website
+
+# Copies the site and install script to GitHub Pages. No build, so it takes seconds,
+# and it runs only when one of those files changes.
+on:
+  push:
+    branches: [main]
+    paths:
+      - site/**
+      - packaging/install.sh
+      - .github/workflows/pages.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: cp packaging/install.sh site/install.sh
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - id: deployment
+        uses: actions/deploy-pages@v4

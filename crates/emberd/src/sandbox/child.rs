@@ -339,7 +339,12 @@ fn pivot() -> io::Result<()> {
     sys_mount("none", Path::new("/"), None, flags, None)
 }
 
-fn set_rlimit(res: libc::__rlimit_resource_t, soft: u64, hard: u64) -> io::Result<()> {
+#[cfg(target_env = "musl")]
+type RlimitResource = libc::c_int;
+#[cfg(not(target_env = "musl"))]
+type RlimitResource = libc::__rlimit_resource_t;
+
+fn set_rlimit(res: RlimitResource, soft: u64, hard: u64) -> io::Result<()> {
     let lim = libc::rlimit { rlim_cur: soft, rlim_max: hard };
     // SAFETY: `lim` is a valid pointer for the call.
     cvt(unsafe { libc::setrlimit(res, &lim) })?;

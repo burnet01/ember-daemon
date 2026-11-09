@@ -2,8 +2,8 @@
 # Runs ember-probe inside a real sandbox. Requires root and a built debug target.
 set -euo pipefail
 
-EMBERD=./target/debug/emberd
-PROBE=./target/debug/ember-probe
+EMBERD=${EMBERD:-./target/debug/emberd}
+PROBE=${PROBE:-./target/debug/ember-probe}
 SECRET=/var/lib/ember-test-secret
 LISTEN_PORT=18080
 
