@@ -1,0 +1,63 @@
+name: Test node
+run-name: Test node ${{ inputs.name }}
+
+# Started by the panel's Create Node button. A temporary node for trying things over real
+# Tailscale, not for hosting: it stops after 20 minutes and leaves the tailnet.
+# There is deliberately no concurrency group, so it never waits on or cancels other runs.
+on:
+  workflow_dispatch:
+    inputs:
+      name:
+        description: Name on Tailscale, like ember-test-1
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  node:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      NODE_NAME: ${{ inputs.name }}
+      TEST_MINUTES: "20"
+    steps:
+      - name: Check the name and secrets
+        env:
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+          EMBER_OWNER: ${{ secrets.EMBER_OWNER }}
+        run: |
+          if [ -z "$TS_AUTHKEY" ] || [ -z "$EMBER_OWNER" ]; then
+            echo "::error::Set the TS_AUTHKEY and EMBER_OWNER repository secrets first."
+            exit 1
+          fi
+          if ! printf '%s' "$NODE_NAME" | grep -Eq '^[a-z0-9-]{1,50}$'; then
+            echo "::error::A node name can only use lowercase letters, digits and dashes."
+            exit 1
+          fi
+      # The same command anyone uses, and it installs the release instead of building, so it's
+      # up within a minute or two. The key comes from a secret, so GitHub hides it in the log.
+      - name: Install
+        env:
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+          EMBER_OWNER: ${{ secrets.EMBER_OWNER }}
+        run: curl -fsSL https://burnet01.github.io/ember-daemon/install.sh | sudo --preserve-env=TS_AUTHKEY bash -s -- --owner "$EMBER_OWNER" --hostname "$NODE_NAME" --no-auto-update
+      - name: Stay up for the test window
+        run: |
+          echo "$NODE_NAME is up for $TEST_MINUTES minutes."
+          end=$(( $(date +%s) + TEST_MINUTES * 60 ))
+          while [ "$(date +%s)" -lt "$end" ]; do
+            if [ "$(systemctl is-active emberd)" != "active" ]; then
+              echo "::error::emberd stopped unexpectedly."
+              sudo journalctl -u emberd -n 40 --no-pager -o cat
+              exit 1
+            fi
+            sleep 30
+          done
+          echo "Test window finished."
+      - name: Stop servers and leave the tailnet
+        if: always()
+        run: |
+          sudo systemctl stop emberd || true
+          sudo tailscale logout || true

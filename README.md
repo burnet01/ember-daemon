@@ -53,9 +53,12 @@ The test suites never run automatically, to keep GitHub Actions usage low. Start
 | `e2e-vanilla` | Boots a real server, pings it from a separate network namespace, and attacks the API |
 | `e2e-all-flavors` | The same, plus Paper, Fabric and Forge boots |
 | `release` | Builds the release daemon |
-| `tailnet-test` | Runs a temporary node on your tailnet for 20 minutes to try the panel, then leaves. Needs the `TS_AUTHKEY` (ephemeral) and `EMBER_OWNER` secrets. Not for hosting |
 
 CI runners are not on a tailnet, so the end-to-end test replaces tailscaled with a fake one speaking the same local API. Everything else in that path is real.
+
+## Test nodes
+
+The `Test node` workflow runs a temporary node on your tailnet for 20 minutes to try the panel, then leaves. It doesn't wait on other runs or cancel them, and it installs the latest release, so it's up in a minute or two. It needs the `TS_AUTHKEY` and `EMBER_OWNER` secrets, and a reusable key lets several run at once. It isn't for hosting.
 
 ## Publishing
 
