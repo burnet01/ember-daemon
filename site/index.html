@@ -56,6 +56,9 @@
   li { margin-bottom: 7px; }
   li code, .note code { font-size: .92em; color: var(--text); background: var(--raised); padding: 2px 6px; border-radius: 5px; }
   a { color: #ffb98a; }
+  .plain { color: var(--muted); margin: 8px 0 12px; }
+  pre { background: #070504; border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; margin: 0 0 16px; overflow-x: auto; }
+  pre code { font-size: 13.5px; color: #ffb98a; }
   footer { color: var(--muted); font-size: 14px; }
   @media (max-width: 520px) {
     main { padding-top: 32px; }
@@ -104,11 +107,25 @@
       <li>Installs <code>nftables</code>, <code>iproute2</code> and Tailscale if they're missing.</li>
       <li>Downloads the daemon, checks its checksum and starts it as a service.</li>
       <li>Makes your Tailscale login the only one allowed to manage the node.</li>
+      <li>Checks for new releases each night at about 4 AM, machine time.</li>
+    </ul>
+    <h2>Fully automatic, with no login link</h2>
+    <p class="plain">Add a <a href="https://login.tailscale.com/admin/settings/keys">Tailscale auth key</a> to the command and nobody has to touch anything:</p>
+    <pre><code>curl -fsSL https://burnet01.github.io/TESTME/install.sh | sudo bash -s -- --auth-key tskey-auth-YOUR-KEY</code></pre>
+    <p class="plain">On GitHub Actions, keep the key in a repository secret. Anything written in a workflow file is readable by anyone who can see the repo.</p>
+    <pre><code>- run: curl -fsSL https://burnet01.github.io/TESTME/install.sh | sudo bash -s -- --auth-key "$TS_AUTHKEY"
+  env:
+    TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}</code></pre>
+    <ul>
+      <li>Use a single-use key, because a command you type stays in your shell history.</li>
+      <li>Don't use a key with tags, or also add <code>--owner your@login</code>, because a tagged machine has no owner to detect.</li>
+      <li>An Actions runner only lasts as long as its job, so the node goes away when the job ends.</li>
     </ul>
     <h2>Good to know</h2>
     <ul>
       <li>It needs 64-bit x86 Linux with systemd and cgroup v2, which most current distros have.</li>
-      <li>Run the same command to update. If there's a new version, running servers stop and only those with autostart come back.</li>
+      <li>When an update installs, it waits for backups to finish. Running servers then restart, so players get disconnected for a moment. If the new version won't start, the old one is put back.</li>
+      <li>To turn updates off, run <code>sudo bash -s -- --no-auto-update</code> instead of <code>sudo bash</code>.</li>
       <li>Management only works over Tailscale, so finding this page doesn't give anyone access to your node.</li>
     </ul>
   </section>

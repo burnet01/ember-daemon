@@ -300,6 +300,8 @@ pub struct Manager {
     restart_tx: mpsc::UnboundedSender<Arc<Instance>>,
     restart_rx: Mutex<Option<mpsc::UnboundedReceiver<Arc<Instance>>>>,
     creating: Mutex<()>,
+    restart_wanted: tokio::sync::Notify,
+    restarting: AtomicBool,
 }
 
 impl Manager {
@@ -314,6 +316,8 @@ impl Manager {
             restart_tx,
             restart_rx: Mutex::new(Some(restart_rx)),
             creating: Mutex::new(()),
+            restart_wanted: tokio::sync::Notify::new(),
+            restarting: AtomicBool::new(false),
             cfg,
             http,
             java_lock: tokio::sync::Mutex::new(()),
@@ -324,6 +328,8 @@ impl Manager {
         std::fs::DirBuilder::new().recursive(true).mode(0o711).create(&mgr.cfg.data_dir)?;
         std::fs::DirBuilder::new().recursive(true).mode(0o700).create(mgr.servers_dir())?;
         std::fs::DirBuilder::new().recursive(true).mode(0o755).create(mgr.runtimes_dir())?;
+        // A request from before this start has been answered by this start.
+        let _ = std::fs::remove_file(crate::update::restart_marker(&mgr.cfg.data_dir));
         for e in std::fs::read_dir(mgr.servers_dir())? {
             let path = e?.path().join("server.json");
             if !path.exists() {
@@ -337,6 +343,27 @@ impl Manager {
             mgr.servers.write().expect("servers lock").insert(inst.id, inst);
         }
         Ok(mgr)
+    }
+
+    fn resume_file(&self) -> PathBuf {
+        self.cfg.data_dir.join("resume.json")
+    }
+
+    /// Whether anything is under way that a restart would ruin.
+    fn is_busy(&self) -> bool {
+        self.all().iter().any(|i| {
+            matches!(i.state(), ServerState::Installing | ServerState::Stopping)
+                || i.restoring.load(Ordering::SeqCst)
+                || i.backup.lock().expect("backup lock").is_some()
+        })
+    }
+
+    pub async fn restart_wanted(&self) {
+        self.restart_wanted.notified().await;
+    }
+
+    pub fn restarting(&self) -> bool {
+        self.restarting.load(Ordering::SeqCst)
     }
 
     fn servers_dir(&self) -> PathBuf {
@@ -984,11 +1011,27 @@ impl Manager {
 
         let mgr = self.clone();
         tokio::spawn(async move {
+            // Servers that were running before an update come back with those set to autostart.
+            let resume: Vec<Uuid> = std::fs::read(mgr.resume_file()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
             for inst in mgr.all() {
-                if inst.record().autostart && inst.state() == ServerState::Offline {
+                if (inst.record().autostart || resume.contains(&inst.id)) && inst.state() == ServerState::Offline {
                     if let Err(e) = mgr.start(inst.clone()).await {
                         tracing::error!(server = %inst.id, "autostart failed: {}", e.1);
                     }
+                }
+            }
+            let _ = std::fs::remove_file(mgr.resume_file());
+        });
+
+        let mgr = self.clone();
+        tokio::spawn(async move {
+            let marker = crate::update::restart_marker(&mgr.cfg.data_dir);
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                if marker.exists() && !mgr.is_busy() {
+                    mgr.restarting.store(true, Ordering::SeqCst);
+                    mgr.restart_wanted.notify_one();
+                    return;
                 }
             }
         });
@@ -1017,6 +1060,19 @@ impl Manager {
     }
 
     pub async fn shutdown(&self) {
+        let marker = crate::update::restart_marker(&self.cfg.data_dir);
+        if marker.exists() {
+            let running: Vec<Uuid> = self.all().iter().filter(|i| matches!(i.state(), ServerState::Running | ServerState::Starting)).map(|i| i.id).collect();
+            for inst in self.all().iter().filter(|i| running.contains(&i.id)) {
+                inst.log("[ember] Restarting for an update. This server will come back by itself.");
+            }
+            match serde_json::to_vec(&running).map_err(anyhow::Error::from).and_then(|b| Ok(std::fs::write(self.resume_file(), b)?)) {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(marker);
+                }
+                Err(e) => tracing::error!("could not record running servers: {e:#}"),
+            }
+        }
         let stops = self.all().into_iter().map(|inst| async move {
             if let Err(e) = self.stop(inst).await {
                 tracing::error!("stop during shutdown failed: {}", e.1);

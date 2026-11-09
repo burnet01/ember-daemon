@@ -1,7 +1,8 @@
 name: Publish
 
-# Builds the daemon and panel and publishes them as a release. Runs only when a
-# version tag is pushed or by hand, never on ordinary commits.
+# Tests and builds the daemon and panel and publishes them as a release. Nodes install
+# releases by themselves, so nothing is published unless the full tests pass on the exact
+# daemon being released. Runs only when a version tag is pushed or by hand.
 on:
   push:
     tags: ["v*"]
@@ -25,15 +26,22 @@ jobs:
   daemon:
     name: Linux daemon
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools nftables iproute2 openssh-client
       - run: rustup toolchain install stable --profile minimal -t x86_64-unknown-linux-musl && rustup default stable
       - run: cargo test -p ember-proto -p emberd
       # Static, so one file runs on any distro whatever its system libraries.
-      - run: cargo build --release -p emberd --target x86_64-unknown-linux-musl
+      - run: cargo build --release -p emberd -p ember-probe --target x86_64-unknown-linux-musl
       - run: cp target/x86_64-unknown-linux-musl/release/emberd emberd-linux-x86_64
+      - name: Sandbox escape attempts
+        env:
+          EMBERD: ./target/x86_64-unknown-linux-musl/release/emberd
+          PROBE: ./target/x86_64-unknown-linux-musl/release/ember-probe
+        run: sudo -E bash scripts/ci-sandbox.sh
+      - name: Real Minecraft end to end
+        run: sudo python3 scripts/e2e.py --emberd ./emberd-linux-x86_64
       - uses: actions/upload-artifact@v4
         with:
           name: daemon

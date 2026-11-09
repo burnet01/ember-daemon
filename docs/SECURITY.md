@@ -19,6 +19,16 @@ Ember assumes a game server can be fully compromised, because Minecraft plugins 
 - It offers SFTP only: no shell, command execution or port forwarding. Links cannot be created, and existing links are never followed out of the folder.
 - FTP is not offered, because it has no encryption of its own.
 
+## Automatic updates
+
+- Each night a systemd timer runs `emberd self-update` as root. It downloads the latest GitHub release over HTTPS and checks it against the release's checksum file.
+- That checksum catches a damaged download, not a malicious release, because both files come from the same place. Anyone who can publish a release on the GitHub repo can run code as root on every node at its next update, so protect that account with two-factor authentication.
+- To opt out, run the installer with `--no-auto-update`.
+
+## Auth keys
+
+The installer can log in to Tailscale with a key from `--auth-key` or `TS_AUTHKEY`. It never prints the key, and it hands it to Tailscale in a private temporary file. A key typed into a command still stays in that shell's history and is briefly visible in the process list, so use single-use keys. In a workflow, use a secret.
+
 ## Sandbox layers
 
 | Layer | Provides |
@@ -46,7 +56,7 @@ Console output is sanitized so a server cannot send terminal control sequences t
 - **Servers cannot reach each other.** This is deliberate, but proxy setups such as Velocity need it, and it is not supported yet.
 - **Game ports are public.** Anyone on the internet can connect to a port you open, so use a whitelist on private servers.
 - **Traffic between the panel and daemon** relies on Tailscale's WireGuard encryption rather than TLS.
-- **Servers stop when the daemon stops.** A daemon restart stops them, and only those with autostart come back.
+- **Servers stop when the daemon stops.** After an update, servers that were running come back. After any other restart or a reboot, only those with autostart do.
 
 ## Not yet verified
 

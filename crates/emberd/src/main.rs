@@ -31,6 +31,12 @@ mod sandbox;
 mod sandbox_test;
 #[cfg(target_os = "linux")]
 mod sftp;
+#[cfg(target_os = "linux")]
+mod update;
+
+/// EX_TEMPFAIL: not an error, just time to be started again.
+#[cfg(target_os = "linux")]
+const RESTART_EXIT: i32 = 75;
 
 #[cfg(target_os = "linux")]
 fn main() {
@@ -61,11 +67,13 @@ fn cli() -> anyhow::Result<()> {
             let code = tokio::runtime::Runtime::new()?.block_on(sandbox_test::run(&args[1..]))?;
             std::process::exit(code);
         }
+        Some("self-update") => tokio::runtime::Runtime::new()?.block_on(update::run(&args[1..], &config_path(&args))),
+        Some("prepare-restart") => update::prepare_restart(&config_path(&args)),
         Some("version" | "--version") => {
             println!("emberd {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        Some(other) => anyhow::bail!("unknown command {other:?}. Commands: run, doctor, sandbox-test, version"),
+        Some(other) => anyhow::bail!("unknown command {other:?}. Commands: run, doctor, sandbox-test, self-update, prepare-restart, version"),
     }
 }
 
@@ -137,12 +145,23 @@ async fn serve(config: std::path::PathBuf) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| format!("listen on {addr}"))?;
     tracing::info!(%addr, "emberd is listening on Tailscale");
 
+    let waiter = mgr.clone();
     axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            tokio::select! {
+                () = shutdown_signal() => {}
+                () = waiter.restart_wanted() => {}
+            }
+        })
         .await?;
 
     tracing::info!("stopping all servers");
     mgr.shutdown().await;
+    if mgr.restarting() {
+        // A failure status, so systemd's Restart=on-failure starts the new version.
+        tracing::info!("restarting to finish an update");
+        std::process::exit(RESTART_EXIT);
+    }
     Ok(())
 }
 

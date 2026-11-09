@@ -4,8 +4,12 @@
 #   curl -fsSL https://burnet01.github.io/TESTME/install.sh | sudo bash
 #
 # Options, passed after `sudo bash -s --`:
+#   --auth-key KEY  Log in to Tailscale with this key, so nobody has to open a login link.
+#                   The TS_AUTHKEY environment variable works too.
+#   --hostname NAME Name for this machine on Tailscale, used with a key.
 #   --owner LOGIN   Tailscale login allowed to manage this node. Defaults to the machine's own.
 #   --binary PATH   Install this emberd instead of downloading the latest release.
+#   --no-auto-update  Don't install new releases by itself each night.
 #
 # Everything is inside main so a download cut off halfway can't run part of the script.
 set -euo pipefail
@@ -54,13 +58,30 @@ install_requirements() {
   fi
 }
 
+login_with_key() {
+  say "Logging in to Tailscale with the key"
+  # In a private file, so the key isn't visible in this machine's process list.
+  local key_file=$WORK/tailscale-key
+  (umask 077; printf '%s' "$AUTH_KEY" >"$key_file")
+  local args=(--auth-key="file:$key_file" --timeout=120s)
+  if [ -n "$TS_NAME" ]; then args+=(--hostname="$TS_NAME"); fi
+  local result=0
+  tailscale up "${args[@]}" </dev/null || result=$?
+  rm -f "$key_file"
+  [ "$result" -eq 0 ] || die "Tailscale didn't accept the key. It may be expired, already used or revoked"
+}
+
 setup_tailscale() {
   if ! command -v tailscale >/dev/null; then
     say "Installing Tailscale"
     curl -fsSL https://tailscale.com/install.sh | sh
   fi
   systemctl enable --now tailscaled >/dev/null 2>&1 || true
-  if ! tailscale ip -4 >/dev/null 2>&1; then
+  if tailscale ip -4 >/dev/null 2>&1; then
+    [ -z "$AUTH_KEY" ] || say "Already on Tailscale, so the key wasn't needed"
+  elif [ -n "$AUTH_KEY" ]; then
+    login_with_key
+  else
     say "Log this machine in to Tailscale with the link below"
     tailscale up </dev/null
   fi
@@ -157,7 +178,8 @@ start_service() {
   if ! systemctl is-active -q emberd; then
     systemctl start emberd
   elif [ "$CHANGED" -eq 1 ]; then
-    say "Restarting the daemon. Running servers stop, and only those with autostart come back"
+    say "Restarting the daemon. Running servers stop and come back by themselves"
+    "$TARGET" prepare-restart || true
     systemctl restart emberd
   fi
   sleep 2
@@ -167,13 +189,54 @@ start_service() {
   fi
 }
 
+setup_auto_update() {
+  if [ "$AUTO_UPDATE" -eq 0 ]; then
+    systemctl disable --now ember-update.timer >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/ember-update.timer /etc/systemd/system/ember-update.service
+    systemctl daemon-reload
+    say "Automatic updates are off"
+    return
+  fi
+  cat >/etc/systemd/system/ember-update.service <<'EOF'
+[Unit]
+Description=Install the latest Ember daemon
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/emberd self-update
+# It waits for backups and installs to finish before restarting the daemon.
+TimeoutStartSec=3h
+EOF
+  cat >/etc/systemd/system/ember-update.timer <<'EOF'
+[Unit]
+Description=Check for a new Ember daemon each night
+
+[Timer]
+OnCalendar=*-*-* 04:00:00
+RandomizedDelaySec=30min
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now ember-update.timer >/dev/null 2>&1
+}
+
 main() {
   OWNER=""
   BINARY=""
+  AUTO_UPDATE=1
+  TS_NAME=""
+  AUTH_KEY=${TS_AUTHKEY:-}
   while [ "$#" -gt 0 ]; do
     case "$1" in
+      --auth-key) [ "$#" -ge 2 ] || die "--auth-key needs a key"; AUTH_KEY=$2; shift 2 ;;
+      --hostname) [ "$#" -ge 2 ] || die "--hostname needs a name"; TS_NAME=$2; shift 2 ;;
       --owner) [ "$#" -ge 2 ] || die "--owner needs a login"; OWNER=$2; shift 2 ;;
       --binary) [ "$#" -ge 2 ] || die "--binary needs a path"; BINARY=$2; shift 2 ;;
+      --no-auto-update) AUTO_UPDATE=0; shift ;;
       *) die "unknown option: $1" ;;
     esac
   done
@@ -188,10 +251,15 @@ main() {
   install_binary
   write_unit
   start_service
+  setup_auto_update
 
   say "Ember is running at $NODE_IP"
   echo "Open Ember Panel on a device logged in to Tailscale as $OWNER, and this node appears by itself."
-  echo "Run the same command again any time to update."
+  if [ "$AUTO_UPDATE" -eq 1 ]; then
+    echo "New releases install by themselves at about 4 AM, machine time."
+  else
+    echo "Run the same command again to update."
+  fi
 }
 
 main "$@"

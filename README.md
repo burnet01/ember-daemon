@@ -18,7 +18,17 @@ curl -fsSL https://burnet01.github.io/TESTME/install.sh | sudo bash
 
 It installs `nftables`, `iproute2` and Tailscale if they're missing, shows a login link if the machine isn't on Tailscale, and makes that machine's Tailscale login the owner. To set a different owner, add `-s -- --owner you@example.com` after `bash`.
 
-Run the same command to update. Check a node with `sudo emberd doctor`.
+To skip the login link, for example on GitHub Actions or a new cloud machine, include a Tailscale auth key:
+
+```sh
+curl -fsSL https://burnet01.github.io/TESTME/install.sh | sudo bash -s -- --auth-key tskey-auth-YOUR-KEY
+```
+
+Use a single-use key. On GitHub Actions, put it in a repository secret and pass `--auth-key "$TS_AUTHKEY"`, because workflow files are readable by anyone who can see the repo. A key with tags also needs `--owner`.
+
+New releases install by themselves at about 4 AM, machine time. Updates wait for backups and installs to finish, bring running servers back afterward, and put the old version back if the new one won't start. To turn this off, run the command with `-s -- --no-auto-update` after `bash`. To update right away, run `sudo systemctl start ember-update`.
+
+Check a node with `sudo emberd doctor`.
 
 ## Run the panel
 
@@ -52,7 +62,7 @@ CI runners are not on a tailnet, so the end-to-end test replaces tailscaled with
 
 ## Publishing
 
-Pushing a version tag such as `v0.2.0` runs the `Publish` workflow, which tests and builds both programs and creates a release. The install command and download link always use the latest release. The `Website` workflow updates the site in a few seconds when `site/` or `packaging/install.sh` changes.
+Pushing a version tag such as `v0.2.0` runs the `Publish` workflow. It builds both programs, runs the unit, sandbox and Vanilla end-to-end tests on the exact daemon being released, and creates a release only if they pass. Nodes pick it up that night, and the install command and download link always use the latest release. The `Website` workflow updates the site in a few seconds when `site/` or `packaging/install.sh` changes.
 
 ## Development
 

@@ -122,29 +122,13 @@ jobs:
           restore-keys: linux-
       - run: rustup toolchain install stable --profile minimal && rustup default stable
       - run: cargo build -p emberd
-      - name: Install requirements
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq nftables iproute2
-          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
-          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.tailscale-keyring.list | sudo tee /etc/apt/sources.list.d/tailscale.list >/dev/null
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq tailscale
-          sudo systemctl enable --now tailscaled
-      - name: Join the tailnet
+      # The same installer anyone uses, with no login step. The key comes from a secret, so
+      # GitHub hides it in the log. It must never be written in this file: the repo is public.
+      - name: Install with the auth key
         env:
           TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
-        run: |
-          key_file=$(mktemp)
-          chmod 600 "$key_file"
-          printf '%s' "$TS_AUTHKEY" > "$key_file"
-          sudo tailscale up --auth-key="file:$key_file" --hostname="ember-ci-$GITHUB_RUN_ID" --accept-dns=false --accept-routes=false
-          rm -f "$key_file"
-          tailscale ip -4
-      - name: Install emberd
-        env:
           EMBER_OWNER: ${{ secrets.EMBER_OWNER }}
-        run: sudo bash packaging/install.sh --binary ./target/debug/emberd --owner "$EMBER_OWNER"
+        run: sudo --preserve-env=TS_AUTHKEY bash packaging/install.sh --binary ./target/debug/emberd --owner "$EMBER_OWNER" --hostname "ember-ci-$GITHUB_RUN_ID" --no-auto-update
       - name: Stay up for the test window
         run: |
           echo "Test node is up as ember-ci-$GITHUB_RUN_ID for $TEST_MINUTES minutes."

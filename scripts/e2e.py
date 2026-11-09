@@ -637,6 +637,46 @@ def test_flavor(flavor, port):
     api("DELETE", f"/v1/servers/{sid}")
 
 
+def test_update_restart(data_root, start_daemon, daemon):
+    print("=== restarting for an update", flush=True)
+    req = {"name": "E2E update", "flavor": "vanilla", "version": VERSION["id"], "limits": LIMITS, "port": 25590, "eula_accepted": True, "start_after_install": True}
+    code, info = api("POST", "/v1/servers", req)
+    check("a server for the update test is created", code == 201, str(code))
+    sid = info["id"]
+    state, _ = wait_state(sid, ("running",), 420)
+    check("it is running, without autostart", state == "running" and not info["autostart"], str(state))
+    marker = pathlib.Path(data_root) / "restart-requested"
+
+    # The request arrives during a backup, which has to finish first.
+    result = {}
+    backing_up = threading.Thread(target=lambda: result.update(code=api("POST", f"/v1/servers/{sid}/backups", {"name": "before update"}, timeout=120)[0]))
+    backing_up.start()
+    time.sleep(1)
+    marker.write_text("")
+    backing_up.join()
+    check("a backup under way finishes first", result.get("code") == 201, str(result))
+    check("the daemon exits to be restarted", daemon.wait(timeout=120) == 75, str(daemon.poll()))
+    check("the request is used up", not marker.exists())
+
+    daemon = start_daemon()
+    check("the daemon comes back", wait_for_api())
+    state, _ = wait_state(sid, ("running",), 240)
+    check("the running server comes back by itself", state == "running", str(state))
+    ok, detail = ext_ping(25590)
+    check("players can reach it after the update", ok, detail)
+    check("the list of running servers is used up", not (pathlib.Path(data_root) / "resume.json").exists())
+
+    # An ordinary restart must not bring back a server without autostart.
+    daemon.send_signal(signal.SIGTERM)
+    check("an ordinary stop exits cleanly", daemon.wait(timeout=120) == 0)
+    daemon = start_daemon()
+    check("the daemon comes back again", wait_for_api())
+    time.sleep(5)
+    check("after an ordinary restart it stays offline", api("GET", f"/v1/servers/{sid}")[1]["state"] == "offline")
+    check("the update test server is removed", api("DELETE", f"/v1/servers/{sid}", timeout=120)[0] == 204)
+    return daemon
+
+
 def wait_for_api():
     for _ in range(60):
         try:
@@ -670,7 +710,10 @@ def main():
     setup_ext_ns()
     log_path = os.path.join(work, "emberd.log")
     log = open(log_path, "w")
-    daemon = subprocess.Popen([os.path.abspath(a.emberd), "run", "--config", config], stdout=log, stderr=subprocess.STDOUT)
+    def start_daemon():
+        return subprocess.Popen([os.path.abspath(a.emberd), "run", "--config", config], stdout=log, stderr=subprocess.STDOUT)
+
+    daemon = start_daemon()
     try:
         check("daemon comes up on the Tailscale address", wait_for_api())
         if failures:
@@ -683,6 +726,7 @@ def main():
         test_full_server(version, data_root)
         for i, flavor in enumerate(f for f in a.flavors.split(",") if f):
             test_flavor(flavor, 25600 + i)
+        daemon = test_update_restart(data_root, start_daemon, daemon)
 
         print("=== graceful daemon shutdown", flush=True)
         daemon.send_signal(signal.SIGTERM)
