@@ -49,6 +49,15 @@ install_packages() {
 install_requirements() {
   local missing=()
   command -v nft >/dev/null || missing+=(nftables)
+  if ! command -v bsdtar >/dev/null; then
+    if command -v apt-get >/dev/null; then
+      missing+=(libarchive-tools)
+    elif command -v pacman >/dev/null; then
+      missing+=(libarchive)
+    else
+      missing+=(bsdtar)
+    fi
+  fi
   if ! command -v ip >/dev/null; then
     if command -v dnf >/dev/null; then missing+=(iproute); else missing+=(iproute2); fi
   fi

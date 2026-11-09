@@ -131,6 +131,10 @@ async fn sweep_stale() {
     };
     while let Ok(Some(e)) = rd.next_entry().await {
         let name = e.file_name().to_string_lossy().into_owned();
+        if name.strip_prefix("ember-x").is_some_and(|i| i.parse::<u32>().is_ok()) {
+            let _ = run("ip", &["netns", "del", &name]).await;
+            continue;
+        }
         if let Some(index) = name.strip_prefix("ember-").and_then(|i| i.parse::<u32>().ok()) {
             tracing::warn!(netns = %name, "removing stale network namespace");
             let host = format!("embh{index}");
@@ -138,6 +142,22 @@ async fn sweep_stale() {
             let _ = run("ip", &["netns", "del", &name]).await;
         }
     }
+}
+
+fn offline_name(index: u32) -> String {
+    format!("ember-x{index}")
+}
+
+/// A namespace with nothing in it, for work that has no reason to touch a network.
+pub async fn offline_up(index: u32) -> Result<String> {
+    let ns = offline_name(index);
+    let _ = run("ip", &["netns", "del", &ns]).await;
+    run("ip", &["netns", "add", &ns]).await?;
+    Ok(ns)
+}
+
+pub async fn offline_down(index: u32) {
+    let _ = run("ip", &["netns", "del", &offline_name(index)]).await;
 }
 
 /// Creates the namespace, wires it to the host and opens the game port.

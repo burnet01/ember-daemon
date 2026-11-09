@@ -16,7 +16,7 @@ The steps are also at <https://burnet01.github.io/ember-daemon/>. On x86_64 Linu
 curl -fsSL https://burnet01.github.io/ember-daemon/install.sh | sudo bash
 ```
 
-It installs `nftables`, `iproute2` and Tailscale if they're missing, shows a login link if the machine isn't on Tailscale, and makes that machine's Tailscale login the owner. To set a different owner, add `-s -- --owner you@example.com` after `bash`.
+It installs `nftables`, `iproute2`, `bsdtar` and Tailscale if they're missing, shows a login link if the machine isn't on Tailscale, and makes that machine's Tailscale login the owner. To set a different owner, add `-s -- --owner you@example.com` after `bash`.
 
 To skip the login link, for example on GitHub Actions or a new cloud machine, include a Tailscale auth key:
 

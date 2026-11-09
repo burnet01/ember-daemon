@@ -237,6 +237,51 @@ async fn download_inner(http: &reqwest::Client, url: &str, dest: &Path, verify: 
     }
 }
 
+const ARCHIVE_TOOL_PATHS: [&str; 2] = ["/usr/bin/bsdtar", "/bin/bsdtar"];
+
+fn find_archive_tool() -> Option<&'static str> {
+    ARCHIVE_TOOL_PATHS.into_iter().find(|p| Path::new(p).exists())
+}
+
+/// Finds `bsdtar`, which reads zip, rar, 7z and tar. A node that got here through automatic
+/// updates never ran the newer installer, so this installs it the first time it's needed.
+pub async fn ensure_archive_tool(mgr: &Manager) -> Result<&'static str> {
+    if let Some(tool) = find_archive_tool() {
+        return Ok(tool);
+    }
+    let _guard = mgr.archive_tool_lock.lock().await;
+    if let Some(tool) = find_archive_tool() {
+        return Ok(tool);
+    }
+    let attempts: [(&str, &[&str]); 4] = [
+        ("apt-get", &["install", "-y", "-qq", "libarchive-tools"]),
+        ("dnf", &["install", "-y", "-q", "bsdtar"]),
+        ("pacman", &["-S", "--noconfirm", "--needed", "libarchive"]),
+        ("zypper", &["--non-interactive", "install", "bsdtar"]),
+    ];
+    for (manager, args) in attempts {
+        if manager == "apt-get" {
+            let _ = package_command("apt-get", &["update", "-qq"]).await;
+        }
+        if package_command(manager, args).await {
+            break;
+        }
+    }
+    find_archive_tool().ok_or_else(|| anyhow!("couldn't install the archive tool. Install libarchive-tools on this node, then try again"))
+}
+
+async fn package_command(program: &str, args: &[&str]) -> bool {
+    let run = tokio::process::Command::new(program)
+        .args(args)
+        .env("DEBIAN_FRONTEND", "noninteractive")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .status();
+    matches!(tokio::time::timeout(std::time::Duration::from_secs(300), run).await, Ok(Ok(s)) if s.success())
+}
+
 /// Installs an Eclipse Temurin runtime shared read-only by all servers that need it.
 pub async fn ensure_java(mgr: &Manager, major: u32) -> Result<PathBuf> {
     #[derive(Deserialize)]

@@ -708,14 +708,14 @@ dependencies = [
 
 [[package]]
 name = "ember-probe"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "ember-proto"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -724,7 +724,7 @@ dependencies = [
 
 [[package]]
 name = "emberd"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "axum",

@@ -79,6 +79,7 @@ pub struct Instance {
     crashes: Mutex<Vec<Instant>>,
     backup: Mutex<Option<(String, Arc<backup::Progress>)>>,
     restoring: AtomicBool,
+    extracting: AtomicBool,
 }
 
 /// The first port from `start` up that `usable` accepts.
@@ -146,6 +147,7 @@ impl Instance {
             crashes: Mutex::new(Vec::new()),
             backup: Mutex::new(None),
             restoring: AtomicBool::new(false),
+            extracting: AtomicBool::new(false),
         })
     }
 
@@ -301,6 +303,7 @@ pub struct Manager {
     restart_rx: Mutex<Option<mpsc::UnboundedReceiver<Arc<Instance>>>>,
     creating: Mutex<()>,
     restart_wanted: tokio::sync::Notify,
+    pub archive_tool_lock: tokio::sync::Mutex<()>,
     restarting: AtomicBool,
 }
 
@@ -317,6 +320,7 @@ impl Manager {
             restart_rx: Mutex::new(Some(restart_rx)),
             creating: Mutex::new(()),
             restart_wanted: tokio::sync::Notify::new(),
+            archive_tool_lock: tokio::sync::Mutex::new(()),
             restarting: AtomicBool::new(false),
             cfg,
             http,
@@ -354,6 +358,7 @@ impl Manager {
         self.all().iter().any(|i| {
             matches!(i.state(), ServerState::Installing | ServerState::Stopping)
                 || i.restoring.load(Ordering::SeqCst)
+                || i.extracting.load(Ordering::SeqCst)
                 || i.backup.lock().expect("backup lock").is_some()
         })
     }
@@ -525,6 +530,9 @@ impl Manager {
     }
 
     pub async fn reinstall(self: &Arc<Self>, inst: Arc<Instance>) -> ApiResult<()> {
+        if inst.extracting.load(Ordering::SeqCst) {
+            return Err(conflict("wait for the archive to finish extracting"));
+        }
         match inst.state() {
             ServerState::Offline | ServerState::Crashed | ServerState::InstallFailed => {
                 self.spawn_install(inst, false);
@@ -743,6 +751,9 @@ impl Manager {
         if inst.state() == ServerState::Installing {
             return Err(conflict("wait for the install to finish"));
         }
+        if inst.extracting.load(Ordering::SeqCst) {
+            return Err(conflict("wait for the archive to finish extracting"));
+        }
         self.stop_locked(&inst).await?;
         self.servers.write().expect("servers lock").remove(&inst.id);
         let dir = self.server_dir(inst.id);
@@ -920,6 +931,9 @@ impl Manager {
         if matches!(state, ServerState::Installing | ServerState::InstallFailed) {
             return Err(conflict("a server can't be restored until it has installed"));
         }
+        if inst.extracting.load(Ordering::SeqCst) {
+            return Err(conflict("wait for the archive to finish extracting"));
+        }
         let archive = self.backups_dir(inst.id).join(format!("{backup_id}.tar.gz"));
         if !archive.exists() {
             return Err(not_found("backup not found"));
@@ -959,6 +973,90 @@ impl Manager {
                 .map_err(|e| ApiErr(e.0, format!("the backup was restored, but the server could not start: {}", e.1)))?;
         }
         Ok(())
+    }
+
+    /// Unpacks an archive next to itself. The archive may be hostile and the parser is large,
+    /// so it runs in a sandbox like the server's: its user, its files, its limits and no
+    /// network. It gets a cgroup of its own, so it works while the server runs.
+    pub async fn extract(self: &Arc<Self>, inst: Arc<Instance>, rel: &str) -> ApiResult<()> {
+        if inst.state() == ServerState::Installing {
+            return Err(conflict("wait for the install to finish"));
+        }
+        if inst.extracting.swap(true, Ordering::SeqCst) {
+            return Err(conflict("this server is already extracting an archive"));
+        }
+        let result = self.run_extract(&inst, rel).await;
+        inst.extracting.store(false, Ordering::SeqCst);
+        result
+    }
+
+    async fn run_extract(self: &Arc<Self>, inst: &Arc<Instance>, rel: &str) -> ApiResult<()> {
+        let path = files::clean_nonroot(rel).map_err(|e| bad_request(e.to_string()))?;
+        let (data, checked) = (self.data_dir(inst.id), path.clone());
+        tokio::task::spawn_blocking(move || files::open_regular(&files::open_root(&data)?, &checked).map(|_| ()))
+            .await
+            .map_err(anyhow::Error::from)?
+            .map_err(|e| bad_request(format!("{e:#}")))?;
+        let tool = install::ensure_archive_tool(self).await?;
+
+        let rec = inst.record();
+        let key = format!("{}-extract", inst.id);
+        let limits = rec.limits;
+        let cg_key = key.clone();
+        tokio::task::spawn_blocking(move || cgroup::create(&cg_key, &limits)).await.map_err(anyhow::Error::from)??;
+        let result = self.extract_in_sandbox(inst, tool, &path, &key).await;
+        net::offline_down(rec.index).await;
+        let cleanup = key.clone();
+        let _ = tokio::task::spawn_blocking(move || cgroup::kill_and_remove(&cleanup)).await;
+        self.scan_disk(inst).await;
+        result
+    }
+
+    async fn extract_in_sandbox(&self, inst: &Arc<Instance>, tool: &str, path: &Path, key: &str) -> ApiResult<()> {
+        let rec = inst.record();
+        let netns = net::offline_up(rec.index).await?;
+        let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        // The ./ keeps a file named like an option from being read as one.
+        let argv = vec![tool.to_string(), "-xf".into(), format!("./{}", path.display()), "-C".into(), format!("./{}", parent.display())];
+        let spec = build_spec(&self.cfg, inst.owner(), self.data_dir(inst.id), cgroup::dir_for(key), netns, vec![], argv, base_env(), rec.limits.disk_mb);
+        let name = path.display();
+        inst.log(&format!("[ember] Extracting {name}"));
+        let mut child = spawn_helper(&spec)?;
+        drop(child.stdin.take());
+        let readers = start_pumps(&mut child, inst, false);
+
+        let limit = rec.limits.disk_mb * 1024 * 1024;
+        let started = Instant::now();
+        let mut check = tokio::time::interval(Duration::from_secs(1));
+        let mut over_limit = false;
+        let mut timed_out = false;
+        let status = loop {
+            tokio::select! {
+                status = child.wait() => break status,
+                _ = check.tick() => {
+                    over_limit = over_limit || self.scan_disk(inst).await > limit;
+                    timed_out = started.elapsed() > INSTALL_TIMEOUT;
+                    if over_limit || timed_out {
+                        cgroup::kill(key);
+                    }
+                }
+            }
+        };
+        finish_pumps(readers).await;
+        // Checked again after it exits, because a fast bomb can finish between checks.
+        over_limit = over_limit || self.scan_disk(inst).await > limit;
+        let message = if over_limit {
+            format!("{name} is too big for this server's disk limit. It was stopped, so some of its files may be there")
+        } else if timed_out {
+            format!("{name} took too long to extract and was stopped")
+        } else if status.map_err(anyhow::Error::from)?.success() {
+            inst.log(&format!("[ember] Extracted {name}"));
+            return Ok(());
+        } else {
+            format!("{name} couldn't be extracted. It may be damaged or password protected. The console has details")
+        };
+        inst.log(&format!("[ember] {message}"));
+        Err(bad_request(message))
     }
 
     pub fn delete_backup(&self, id: Uuid, backup_id: Uuid) -> ApiResult<()> {

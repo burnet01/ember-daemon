@@ -407,6 +407,7 @@ def test_files(sid, data, uid):
     check("zipping a file is refused", api("GET", f"{base}/download-folder?path=zipme/a.txt")[0] == 400)
     check("no zip is left behind", not list(data.parent.glob(".zip-*")))
     shutil.rmtree(zipped)
+    test_extract(sid, data)
 
     code, _ = api("DELETE", f"{base}?path=evildir")
     check("deleting a dir symlink works", code == 204 and pathlib.Path("/etc/passwd").exists())
@@ -678,6 +679,94 @@ def test_flavor(flavor, port):
     api("DELETE", f"/v1/servers/{sid}")
 
 
+# Tiny RAR files from libarchive's test suite, which is BSD licensed. Nothing free can create one.
+RAR4 = base64.b64decode("UmFyIRoHAM+QcwAADQAAAAAAAACEUnQgkDIAFAAAABQAAAADQqLIvrd22j4UMAgApIEAAHRlc3QudHh0gAi3dto+t3baPnRlc3QgdGV4dCBkb2N1bWVudA0KnS90IJAyAAgAAAAIAAAAA3tEybbRTNg+FDAIAP+hAAB0ZXN0bGlua8AI0UzYPlBf2j50ZXN0LnR4dM3gdCCQOgAUAAAAFAAAAANCosi+Y3faPhQwEACkgQAAdGVzdGRpclx0ZXN0LnR4dMDMY3faPmN32j50ZXN0IHRleHQgZG9jdW1lbnQNCqHIdOCQMQAAAAAAAAAAAAMAAAAAY3faPhQwBwDtQQAAdGVzdGRpcsDMY3faPmR32j7m53TgkDYAAAAAAAAAAAADAAAAAJ2r1T4UMAwA7UEAAHRlc3RlbXB0eWRpcoDMnavVPsVd2j7EPXsAQAcA")
+RAR5 = base64.b64decode("UmFyIRoHAQAzkrXlCgEFBgAFAQGAgAA4MAZjLAIDC50ABJ0ApIMCtEOglYAAAQ5oZWxsb3dvcmxkLnR4dAoDE34Oq1tW6Q4aaGVsbG8gbGliYXJjaGl2ZSB0ZXN0IHN1aXRlIQodd1ZRAwUEAA==")
+
+
+def zip_bytes(entries):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for name, content in entries:
+            z.writestr(name, content)
+    return buf.getvalue()
+
+
+def test_extract(sid, data):
+    print("=== extracting archives", flush=True)
+    base = f"/v1/servers/{sid}/files"
+    uid = (data / "server.jar").stat().st_uid
+
+    def upload(name, blob):
+        return api("PUT", f"{base}/upload?path={urllib.parse.quote(name)}", raw=blob, timeout=120)[0]
+
+    def extract(name):
+        return api("POST", f"{base}/extract", {"path": name}, timeout=300)
+
+    was = api("GET", f"/v1/servers/{sid}")[1]["state"]
+    (data / "unpack").mkdir()
+    os.chown(data / "unpack", uid, uid)
+    upload("unpack/plugins.zip", zip_bytes([("pack/a.txt", "alpha"), ("pack/deep/b.txt", "beta"), ("loose.txt", "gamma")]))
+    code, body = extract("unpack/plugins.zip")
+    check("a zip extracts next to itself", code == 204, f"{code} {body}")
+    check("nested files arrive", (data / "unpack/pack/deep/b.txt").read_text() == "beta" if code == 204 else False)
+    check("extracted files belong to the server", code == 204 and (data / "unpack/pack/a.txt").stat().st_uid == uid)
+    check("the server wasn't disturbed", api("GET", f"/v1/servers/{sid}")[1]["state"] == was, was)
+
+    upload("r4.rar", RAR4)
+    code, body = extract("r4.rar")
+    check("a RAR4 archive extracts", code == 204, f"{code} {body}")
+    check("RAR4 content is right", (data / "testdir/test.txt").read_text().startswith("test text") if code == 204 else False)
+    upload("r5.rar", RAR5)
+    code, body = extract("r5.rar")
+    check("a RAR5 archive extracts", code == 204, f"{code} {body}")
+    check("RAR5 content is right", (data / "helloworld.txt").read_text().startswith("hello libarchive") if code == 204 else False)
+
+    # Attacks. Each stays inside the sandbox, which is what this checks.
+    outside = data.parent / "escape.txt"
+    upload("evil.zip", zip_bytes([("../../escape.txt", "x"), ("../escape.txt", "x"), ("/etc/ember-evil", "x"), ("/tmp/ember-evil", "x")]))
+    extract("evil.zip")
+    check("path traversal can't leave the server", not outside.exists() and not (data.parent.parent / "escape.txt").exists())
+    check("absolute paths can't reach the host", not pathlib.Path("/etc/ember-evil").exists() and not pathlib.Path("/tmp/ember-evil").exists())
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        link = zipfile.ZipInfo("linked")
+        link.create_system = 3
+        link.external_attr = (stat.S_IFLNK | 0o777) << 16
+        z.writestr(link, "/etc/shadow")
+    upload("links.zip", buf.getvalue())
+    extract("links.zip")
+    check("a planted link can't read host files", api("GET", f"{base}/content?path=linked")[0] == 400)
+
+    upload("junk.zip", b"this is not an archive" * 100)
+    code, body = extract("junk.zip")
+    check("a damaged archive fails cleanly", code == 400, f"{code} {body}")
+    check("a missing archive is refused", extract("nope.zip")[0] == 400)
+    check("extracting through a link is refused", extract("evil")[0] == 400)
+    check("extracting outside the server is refused", extract("../server.json")[0] == 400)
+    check("extracting the root is refused", extract("")[0] == 400)
+    netns = subprocess.run(["ip", "netns", "list"], capture_output=True, text=True).stdout
+    check("the extraction network is removed", "ember-x" not in netns, netns.strip())
+    check("the extraction cgroup is removed", not pathlib.Path(f"/sys/fs/cgroup/ember/{sid}-extract").exists())
+
+
+def test_zip_bomb():
+    print("=== zip bomb against a disk limit", flush=True)
+    req = {"name": "E2E bomb", "flavor": "vanilla", "version": VERSION["id"], "limits": {**LIMITS, "disk_mb": 512}, "port": 25591, "eula_accepted": True}
+    code, info = api("POST", "/v1/servers", req)
+    check("a small server is created", code == 201, str(code))
+    sid = info["id"]
+    wait_state(sid, ("offline", "install_failed"), 420)
+    chunk = b"\0" * (64 << 20)
+    blob = zip_bytes([(f"f{i}.bin", chunk) for i in range(16)])
+    code = api("PUT", f"/v1/servers/{sid}/files/upload?path=bomb.zip", raw=blob, timeout=120)[0]
+    check("the bomb uploads, because it is small", code == 204, f"{code} {len(blob)}")
+    code, body = api("POST", f"/v1/servers/{sid}/files/extract", {"path": "bomb.zip"}, timeout=300)
+    check("a zip bomb is stopped at the disk limit", code == 400 and "disk limit" in str(body), f"{code} {body}")
+    check("the bomb server can be removed", api("DELETE", f"/v1/servers/{sid}", timeout=120)[0] == 204)
+
+
 def test_update_restart(data_root, start_daemon, daemon):
     print("=== restarting for an update", flush=True)
     req = {"name": "E2E update", "flavor": "vanilla", "version": VERSION["id"], "limits": LIMITS, "port": 25590, "eula_accepted": True, "start_after_install": True}
@@ -767,6 +856,7 @@ def main():
         test_full_server(version, data_root)
         for i, flavor in enumerate(f for f in a.flavors.split(",") if f):
             test_flavor(flavor, 25600 + i)
+        test_zip_bomb()
         daemon = test_update_restart(data_root, start_daemon, daemon)
 
         print("=== graceful daemon shutdown", flush=True)

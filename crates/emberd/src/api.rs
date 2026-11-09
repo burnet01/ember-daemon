@@ -91,6 +91,7 @@ pub fn router(app: AppState) -> Router {
         .route("/files/mkdir", post(make_dir))
         .route("/files/rename", post(rename_file))
         .route("/files/download", get(download_file))
+        .route("/files/extract", post(extract_file))
         .route("/files/download-folder", get(download_folder))
         .route("/files/upload", put(upload_file).layer(DefaultBodyLimit::disable()))
         .route("/backups", get(list_backups).post(create_backup))
@@ -345,6 +346,13 @@ async fn remove_file(State(app): State<AppState>, Path(id): Path<Uuid>, Query(q)
     inst(&app, id)?;
     let data = app.mgr.data_dir(id);
     file_op(move || files::remove(&files::open_root(&data)?, &q.path)).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn extract_file(State(app): State<AppState>, Path(id): Path<Uuid>, Json(req): Json<PathRequest>) -> ApiResult<StatusCode> {
+    let (mgr, s) = (app.mgr.clone(), inst(&app, id)?);
+    // Its own task, so a panel disconnecting can't leave the sandbox running unwatched.
+    tokio::spawn(async move { mgr.extract(s, &req.path).await }).await.map_err(anyhow::Error::from)??;
     Ok(StatusCode::NO_CONTENT)
 }
 
