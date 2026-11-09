@@ -69,11 +69,12 @@ fn cli() -> anyhow::Result<()> {
         }
         Some("self-update") => tokio::runtime::Runtime::new()?.block_on(update::run(&args[1..], &config_path(&args))),
         Some("prepare-restart") => update::prepare_restart(&config_path(&args)),
+        Some("enable-auto-update") => update::enable_auto_update(),
         Some("version" | "--version") => {
             println!("emberd {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        Some(other) => anyhow::bail!("unknown command {other:?}. Commands: run, doctor, sandbox-test, self-update, prepare-restart, version"),
+        Some(other) => anyhow::bail!("unknown command {other:?}. Commands: run, doctor, sandbox-test, self-update, prepare-restart, enable-auto-update, version"),
     }
 }
 
@@ -118,6 +119,7 @@ async fn serve(config: std::path::PathBuf) -> anyhow::Result<()> {
         .init();
 
     let cfg = config::Config::load(&config)?;
+    update::refresh_timer();
     let ts = auth::Tailscale::new(&cfg.tailscale_socket);
     let me = wait_for_tailscale(&ts).await;
     // There is deliberately no bind setting: the API only ever listens on Tailscale.

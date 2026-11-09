@@ -21,8 +21,8 @@ Ember assumes a game server can be fully compromised, because Minecraft plugins 
 
 ## Automatic updates
 
-- Each night a systemd timer runs `emberd self-update` as root. It downloads the latest GitHub release over HTTPS and checks it against the release's checksum file.
-- That checksum catches a damaged download, not a malicious release, because both files come from the same place. Anyone who can publish a release on the GitHub repo can run code as root on every node at its next update, so protect that account with two-factor authentication.
+- Every 2 minutes a systemd timer runs `emberd self-update` as root. It downloads the latest GitHub release over HTTPS and checks it against the release's checksum file.
+- That checksum catches a damaged download, not a malicious release, because both files come from the same place. Anyone who can publish a release on the GitHub repo can run code as root on every node within minutes, so protect that account with two-factor authentication.
 - To opt out, run the installer with `--no-auto-update`.
 
 ## Auth keys

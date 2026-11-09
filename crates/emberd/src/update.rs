@@ -1,5 +1,5 @@
-//! `emberd self-update`, run nightly by a systemd timer. Installs the latest release, has the
-//! daemon restart once it is idle, and puts the old version back if the new one won't run.
+//! `emberd self-update`, run every couple of minutes by a systemd timer. Installs a new release
+//! as soon as there is one, has the daemon restart once it is idle, and puts the old version back if the new one won't run.
 
 use crate::{auth, config::Config, install};
 use anyhow::{anyhow, bail, Context, Result};
@@ -17,13 +17,72 @@ const BUSY_LIMIT: Duration = Duration::from_secs(2 * 60 * 60);
 const START_LIMIT: Duration = Duration::from_secs(60);
 /// A daemon that dies right after starting must not count as working.
 const STABLE_FOR: Duration = Duration::from_secs(15);
+const HAND_RESTART_GRACE: Duration = Duration::from_secs(15);
+
+const SERVICE_UNIT_PATH: &str = "/etc/systemd/system/ember-update.service";
+const TIMER_UNIT_PATH: &str = "/etc/systemd/system/ember-update.timer";
+const SERVICE_UNIT: &str = "[Unit]
+Description=Install the latest Ember daemon
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/emberd self-update
+# It waits for backups and installs to finish before restarting the daemon.
+TimeoutStartSec=3h
+";
+// Nodes can't be reached from GitHub, so they ask. The check is one tiny file, and a machine
+// that was off or asleep catches up within a minute of starting.
+const TIMER_UNIT: &str = "[Unit]
+Description=Check for a new Ember daemon every 2 minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitInactiveSec=2min
+RandomizedDelaySec=20s
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target
+";
+
+/// Turns on automatic updates. The installer calls this.
+pub fn enable_auto_update() -> Result<()> {
+    std::fs::write(SERVICE_UNIT_PATH, SERVICE_UNIT).context("write update service")?;
+    std::fs::write(TIMER_UNIT_PATH, TIMER_UNIT).context("write update timer")?;
+    if !systemctl_ok(&["daemon-reload"]) || !systemctl_ok(&["enable", "--now", "ember-update.timer"]) {
+        bail!("could not turn on the update timer");
+    }
+    // A timer that was already enabled keeps its old schedule until it restarts.
+    systemctl_ok(&["restart", "ember-update.timer"]);
+    Ok(())
+}
+
+/// Brings an existing node's schedule up to date when a new version first runs. A node with
+/// updates turned off has no timer file, and stays that way.
+pub fn refresh_timer() {
+    let Ok(current) = std::fs::read_to_string(TIMER_UNIT_PATH) else { return };
+    if current == TIMER_UNIT {
+        return;
+    }
+    if let Err(e) = std::fs::write(TIMER_UNIT_PATH, TIMER_UNIT) {
+        tracing::warn!("could not update the update timer: {e}");
+        return;
+    }
+    if systemctl_ok(&["daemon-reload"]) && systemctl_ok(&["restart", "ember-update.timer"]) {
+        tracing::info!("the update timer now checks every 2 minutes");
+    } else {
+        tracing::warn!("could not restart the update timer");
+    }
+}
 
 /// Tells the daemon to restart when idle and bring back what's running. Removed once honored.
 pub fn restart_marker(data_dir: &Path) -> PathBuf {
     data_dir.join("restart-requested")
 }
 
-/// The checksum of a release that failed to run here, so it isn't retried every night.
+/// The checksum of a release that failed to run here, so it isn't retried on every check.
 fn skip_file(data_dir: &Path) -> PathBuf {
     data_dir.join("update-skip")
 }
@@ -57,6 +116,12 @@ fn service_pid() -> Option<String> {
     (!pid.is_empty() && pid != "0").then_some(pid)
 }
 
+/// How many times systemd has restarted the daemon after it failed.
+fn crash_restarts() -> Option<u64> {
+    let out = std::process::Command::new("systemctl").args(["show", "-p", "NRestarts", "--value", SERVICE]).output().ok()?;
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
 async fn listening(addr: std::net::SocketAddr) -> bool {
     matches!(tokio::time::timeout(Duration::from_secs(2), tokio::net::TcpStream::connect(addr)).await, Ok(Ok(_)))
 }
@@ -78,17 +143,30 @@ async fn wait_for_restart(old_pid: Option<&str>) {
     systemctl_ok(&["restart", SERVICE]);
 }
 
-async fn healthy(addr: std::net::SocketAddr) -> bool {
+async fn comes_up(addr: std::net::SocketAddr, limit: Duration) -> bool {
     let start = Instant::now();
     while !listening(addr).await {
-        if start.elapsed() > START_LIMIT {
+        if start.elapsed() > limit {
             return false;
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
-    let pid = service_pid();
+    true
+}
+
+async fn healthy(addr: std::net::SocketAddr) -> bool {
+    if !comes_up(addr, START_LIMIT).await {
+        return false;
+    }
+    let Some(before) = crash_restarts() else { return false };
     tokio::time::sleep(STABLE_FOR).await;
-    pid.is_some() && service_pid() == pid && listening(addr).await
+    // Only a rise means a crash. Someone restarting the daemon by hand during this wait resets
+    // the count, and that must not undo a good update.
+    if crash_restarts().is_none_or(|after| after > before) {
+        return false;
+    }
+    // That restart could also land just now, so it gets a moment to come back.
+    comes_up(addr, HAND_RESTART_GRACE).await
 }
 
 pub async fn run(args: &[String], config: &Path) -> Result<()> {

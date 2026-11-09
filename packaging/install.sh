@@ -9,7 +9,7 @@
 #   --hostname NAME Name for this machine on Tailscale, used with a key.
 #   --owner LOGIN   Tailscale login allowed to manage this node. Defaults to the machine's own.
 #   --binary PATH   Install this emberd instead of downloading the latest release.
-#   --no-auto-update  Don't install new releases by itself each night.
+#   --no-auto-update  Don't install new releases by itself.
 #
 # Everything is inside main so a download cut off halfway can't run part of the script.
 set -euo pipefail
@@ -197,31 +197,7 @@ setup_auto_update() {
     say "Automatic updates are off"
     return
   fi
-  cat >/etc/systemd/system/ember-update.service <<'EOF'
-[Unit]
-Description=Install the latest Ember daemon
-Wants=network-online.target
-After=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/emberd self-update
-# It waits for backups and installs to finish before restarting the daemon.
-TimeoutStartSec=3h
-EOF
-  cat >/etc/systemd/system/ember-update.timer <<'EOF'
-[Unit]
-Description=Check for a new Ember daemon each night
-
-[Timer]
-OnCalendar=*-*-* 04:00:00
-RandomizedDelaySec=30min
-
-[Install]
-WantedBy=timers.target
-EOF
-  systemctl daemon-reload
-  systemctl enable --now ember-update.timer >/dev/null 2>&1
+  "$TARGET" enable-auto-update
 }
 
 main() {
@@ -256,7 +232,7 @@ main() {
   say "Ember is running at $NODE_IP"
   echo "Open Ember Panel on a device logged in to Tailscale as $OWNER, and this node appears by itself."
   if [ "$AUTO_UPDATE" -eq 1 ]; then
-    echo "New releases install by themselves at about 4 AM, machine time."
+    echo "New releases install by themselves within a couple of minutes."
   else
     echo "Run the same command again to update."
   fi
