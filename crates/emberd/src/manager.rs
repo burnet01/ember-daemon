@@ -2,7 +2,7 @@
 //! enforcement and schedules.
 
 use crate::config::Config;
-use crate::error::{bad_request, conflict, not_found, ApiResult};
+use crate::error::{bad_request, conflict, not_found, ApiErr, ApiResult};
 use crate::files::{self, Owner};
 use crate::sandbox::{cgroup, net, RoBind, SandboxSpec, HOME, INIT_ARG, SPEC_ENV};
 use crate::{backup, install};
@@ -78,6 +78,12 @@ pub struct Instance {
     expected_exit: AtomicBool,
     crashes: Mutex<Vec<Instant>>,
     backup: Mutex<Option<(String, Arc<backup::Progress>)>>,
+    restoring: AtomicBool,
+}
+
+/// The first port from `start` up that `usable` accepts.
+fn first_free_port(start: u16, usable: impl Fn(u16) -> bool) -> Option<u16> {
+    (start..=u16::MAX).find(|&port| usable(port))
 }
 
 fn now_secs() -> u64 {
@@ -139,6 +145,7 @@ impl Instance {
             expected_exit: AtomicBool::new(false),
             crashes: Mutex::new(Vec::new()),
             backup: Mutex::new(None),
+            restoring: AtomicBool::new(false),
         })
     }
 
@@ -292,6 +299,7 @@ pub struct Manager {
     cpu_prev: Mutex<Option<(u64, u64)>>,
     restart_tx: mpsc::UnboundedSender<Arc<Instance>>,
     restart_rx: Mutex<Option<mpsc::UnboundedReceiver<Arc<Instance>>>>,
+    creating: Mutex<()>,
 }
 
 impl Manager {
@@ -305,6 +313,7 @@ impl Manager {
         let mgr = Arc::new(Self {
             restart_tx,
             restart_rx: Mutex::new(Some(restart_rx)),
+            creating: Mutex::new(()),
             cfg,
             http,
             java_lock: tokio::sync::Mutex::new(()),
@@ -377,25 +386,30 @@ impl Manager {
         })
     }
 
-    /// DNAT would silently shadow anything already bound here, including tailscaled's UDP port.
-    fn validate_port(&self, port: u16, proto: Protocol) -> ApiResult<()> {
-        if port < 1024 || port == self.cfg.port || port == SFTP_PORT {
-            return Err(bad_request(format!("port {port} is reserved")));
+    fn port_reserved(&self, port: u16) -> bool {
+        port < 1024 || port == self.cfg.port || port == SFTP_PORT
+    }
+
+    /// Takes `wanted`, or the next free port above it if something already has it.
+    /// DNAT would silently shadow anything bound on the host, including tailscaled's UDP port.
+    fn pick_port(&self, wanted: u16, proto: Protocol) -> ApiResult<u16> {
+        if self.port_reserved(wanted) {
+            return Err(bad_request(format!("port {wanted} is reserved")));
         }
-        if self.port_taken(port, proto) {
-            return Err(conflict(format!("port {port} is already used by another server")));
-        }
-        let free = match proto {
-            Protocol::Tcp => std::net::TcpListener::bind(("0.0.0.0", port)).is_ok(),
-            Protocol::Udp => std::net::UdpSocket::bind(("0.0.0.0", port)).is_ok(),
-        };
-        if !free {
-            return Err(conflict(format!("port {port} is already in use on this node")));
-        }
-        Ok(())
+        first_free_port(wanted, |port| {
+            !self.port_reserved(port)
+                && !self.port_taken(port, proto)
+                && match proto {
+                    Protocol::Tcp => std::net::TcpListener::bind(("0.0.0.0", port)).is_ok(),
+                    Protocol::Udp => std::net::UdpSocket::bind(("0.0.0.0", port)).is_ok(),
+                }
+        })
+        .ok_or_else(|| conflict(format!("no free port from {wanted} up")))
     }
 
     pub async fn create(self: &Arc<Self>, req: CreateServer) -> ApiResult<ServerInfo> {
+        // Two creates at once must not pick the same port. Nothing below awaits.
+        let _creating = self.creating.lock().expect("create lock");
         validate_name(&req.name).map_err(bad_request)?;
         req.limits.validate().map_err(bad_request)?;
         let cap = crate::node::capacity(&self.cfg.data_dir);
@@ -410,7 +424,7 @@ impl Manager {
             install::validate_version(&req.version).map_err(|e| bad_request(e.to_string()))?;
             req.version.clone()
         };
-        self.validate_port(req.port, req.flavor.protocol())?;
+        let port = self.pick_port(req.port, req.flavor.protocol())?;
 
         let index = self.allocate_index()?;
         let id = Uuid::new_v4();
@@ -421,7 +435,7 @@ impl Manager {
             version,
             bedrock_url: req.bedrock_url,
             limits: req.limits,
-            port: req.port,
+            port,
             index,
             autostart: false,
             restart_on_crash: false,
@@ -818,7 +832,13 @@ impl Manager {
             }
             *slot = Some((name.trim().to_string(), progress.clone()));
         }
-        let result = self.run_backup(inst, name, progress).await;
+        // Checked after claiming the slot, and restores check the slot after setting this,
+        // so a backup and a restore starting together always see each other.
+        let result = if inst.restoring.load(Ordering::SeqCst) {
+            Err(conflict("a backup is being restored on this server"))
+        } else {
+            self.run_backup(inst, name, progress).await
+        };
         *inst.backup.lock().expect("backup lock") = None;
         result
     }
@@ -853,26 +873,52 @@ impl Manager {
         Ok(info)
     }
 
-    pub async fn restore_backup(&self, inst: Arc<Instance>, backup_id: Uuid) -> ApiResult<()> {
+    /// Works in any state but an install. A server that was online stops first and comes back
+    /// straight away running the backup.
+    pub async fn restore_backup(self: &Arc<Self>, inst: Arc<Instance>, backup_id: Uuid) -> ApiResult<()> {
         let _power = inst.power.lock().await;
-        if !matches!(inst.state(), ServerState::Offline | ServerState::Crashed) {
-            return Err(conflict("stop the server before restoring a backup"));
+        let state = inst.state();
+        if matches!(state, ServerState::Installing | ServerState::InstallFailed) {
+            return Err(conflict("a server can't be restored until it has installed"));
         }
         let archive = self.backups_dir(inst.id).join(format!("{backup_id}.tar.gz"));
         if !archive.exists() {
             return Err(not_found("backup not found"));
         }
+        inst.restoring.store(true, Ordering::SeqCst);
+        let was_online = matches!(state, ServerState::Running | ServerState::Starting);
+        let result = self.replace_files(&inst, archive, was_online).await;
+        inst.restoring.store(false, Ordering::SeqCst);
+        result
+    }
+
+    async fn replace_files(self: &Arc<Self>, inst: &Arc<Instance>, archive: PathBuf, was_online: bool) -> ApiResult<()> {
+        if inst.backup.lock().expect("backup lock").is_some() {
+            return Err(conflict("wait for the running backup to finish"));
+        }
+        self.stop_locked(inst).await?;
+        inst.log("[ember] Restoring backup");
         let data = self.data_dir(inst.id);
         let owner = inst.owner();
         let max = inst.record().limits.disk_mb * 1024 * 1024;
-        tokio::task::spawn_blocking(move || -> Result<()> {
+        let restored = tokio::task::spawn_blocking(move || -> Result<()> {
             let root = files::open_root(&data)?;
             backup::restore(&root, &archive, owner, max)
         })
         .await
-        .map_err(anyhow::Error::from)??;
-        self.scan_disk(&inst).await;
+        .map_err(anyhow::Error::from)?;
+        self.scan_disk(inst).await;
+        if let Err(e) = restored {
+            // The files are incomplete, and booting them could write a fresh world over the rest.
+            inst.log(&format!("[ember] Restore failed, so the server stays offline: {e:#}"));
+            return Err(e.into());
+        }
         inst.log("[ember] Backup restored");
+        if was_online {
+            self.start_locked(inst)
+                .await
+                .map_err(|e| ApiErr(e.0, format!("the backup was restored, but the server could not start: {}", e.1)))?;
+        }
         Ok(())
     }
 
@@ -1320,6 +1366,14 @@ fn disk_usage(path: &Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn port_search_moves_up_to_the_next_free_port() {
+        assert_eq!(first_free_port(25565, |_| true), Some(25565));
+        assert_eq!(first_free_port(25565, |p| p != 25565 && p != 25566), Some(25567));
+        assert_eq!(first_free_port(65534, |p| p == 65535), Some(65535));
+        assert_eq!(first_free_port(65534, |_| false), None, "the top of the range must not wrap");
+    }
 
     #[test]
     fn sanitizer_keeps_colors_and_strips_terminal_attacks() {

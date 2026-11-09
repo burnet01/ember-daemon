@@ -294,8 +294,13 @@ def test_full_server(version, data_root):
         return
     code, _ = api("PATCH", f"/v1/servers/{sid}", {"limits": {**LIMITS, "memory_mb": 4000000}})
     check("settings cannot exceed this machine either", code == 400, str(code))
-    dup = api("POST", "/v1/servers", {**req, "name": "dup"})
-    check("port conflict is refused", dup[0] == 409, str(dup[0]))
+    # 25565 belongs to the server above and another program holds 25566.
+    with socket.create_server(("0.0.0.0", 25566)):
+        code, dup = api("POST", "/v1/servers", {**req, "name": "dup"})
+    check("a taken port moves to the next free one", code == 201 and dup["port"] == 25567, str(dup))
+    if code == 201:
+        wait_state(dup["id"], ("offline", "install_failed"), 420)
+        check("the moved server is removed", api("DELETE", f"/v1/servers/{dup['id']}", timeout=120)[0] == 204)
 
     check("start is accepted", api("POST", f"/v1/servers/{sid}/power", {"action": "start"})[0] == 202)
     state, _ = wait_state(sid, ("running",), 300)
@@ -499,7 +504,30 @@ def test_backups_and_power(sid, data):
     check("progress never passes 100%", all(p["done_bytes"] <= p["total_bytes"] for p in seen))
     check("a second backup at once is refused", second.get("code") == 409, str(second))
     check("progress clears when it finishes", api("GET", f"{base}/backups/progress")[1] is None)
-    check("restore refuses a running server", api("POST", f"{base}/backups/{backup['id']}/restore")[0] == 409)
+
+    # While a backup runs, a restore must wait its turn.
+    other = {}
+    running = threading.Thread(target=lambda: other.update(backup=api("POST", f"{base}/backups", {"name": "during"}, timeout=300)))
+    running.start()
+    time.sleep(1)
+    check("restore is refused during a backup", api("POST", f"{base}/backups/{backup['id']}/restore")[0] == 409)
+    running.join()
+    api("DELETE", f"{base}/backups/{other['backup'][1]['id']}")
+
+    # An online server stops, gets the backup, and comes back by itself.
+    (data / "marker.txt").write_text("changed while online")
+    live = {}
+    restoring = threading.Thread(target=lambda: live.update(code=api("POST", f"{base}/backups/{backup['id']}/restore", timeout=300)[0]))
+    restoring.start()
+    time.sleep(1)
+    check("backup is refused during a restore", api("POST", f"{base}/backups", {"name": "late"}, timeout=60)[0] == 409)
+    restoring.join()
+    check("a running server can be restored", live.get("code") == 204, str(live))
+    check("the live restore put the backup back", (data / "marker.txt").read_text() == "original")
+    state, _ = wait_state(sid, ("running",), 240)
+    check("it comes back running by itself", state == "running", str(state))
+    ok, detail = ext_ping(25565)
+    check("players can reach it after the restore", ok, detail)
 
     check("stop is accepted", api("POST", f"{base}/power", {"action": "stop"})[0] == 202)
     state, _ = wait_state(sid, ("offline",), 90)

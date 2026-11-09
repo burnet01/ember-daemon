@@ -437,7 +437,10 @@ async fn delete_backup(State(app): State<AppState>, Path((id, backup)): Path<(Uu
 }
 
 async fn restore_backup(State(app): State<AppState>, Path((id, backup)): Path<(Uuid, Uuid)>) -> ApiResult<StatusCode> {
-    app.mgr.restore_backup(inst(&app, id)?, backup).await?;
+    let (mgr, s) = (app.mgr.clone(), inst(&app, id)?);
+    // Its own task: once a restore has stopped a server, it must finish and bring the server
+    // back even if the panel disconnects and this request is dropped.
+    tokio::spawn(async move { mgr.restore_backup(s, backup).await }).await.map_err(anyhow::Error::from)??;
     Ok(StatusCode::NO_CONTENT)
 }
 
